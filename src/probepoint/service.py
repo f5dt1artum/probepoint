@@ -2,13 +2,14 @@
 
 The frozen baseline reports process health and exposes the v1 frame codec.
 Breakpoint/watchpoint management lives in :mod:`probepoint.breakpoints`;
-records are process-local and never persisted. Keep the public surface here
-backward compatible.
+records are process-local and never persisted. The GDB RSP packet codec
+lives in :mod:`probepoint.rsp`. Keep the public surface here backward
+compatible.
 """
 
 from __future__ import annotations
 
-from . import __version__
+from . import __version__, rsp
 from .breakpoints import (
     BreakpointStore,
     parse_create,
@@ -38,6 +39,12 @@ class Service:
 
     def decode_stream(self, body: object) -> dict[str, object]:
         return decode_stream(body)
+
+    def encode_rsp(self, body: object) -> dict[str, str]:
+        return rsp.encode_packet(body)
+
+    def decode_rsp_stream(self, body: object) -> dict[str, object]:
+        return rsp.decode_stream(body)
 
     def create_breakpoint(self, body: object) -> dict[str, object]:
         kind, address, size, enabled = parse_create(body)

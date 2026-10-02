@@ -24,6 +24,17 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 请求体非法返回 `error.code=invalid_request`；字段缺失、多余、类型或取值错误返回 `invalid_field`；单帧解码失败按优先级返回 `truncated_frame`、`bad_magic`、`unsupported_version`、`invalid_length`、`trailing_data`、`checksum_mismatch`，均为 HTTP 400。
 
+## GDB RSP 数据包编解码
+
+线上数据包由 `0x24`（`$`）、线上载荷、`0x23`（`#`）和两位小写十六进制校验和组成；载荷内 `0x24`、`0x23`、`0x7d`、`0x2a` 改写为 `0x7d` 后跟原值异或 `0x20`，校验和为线上载荷字节和模 256。
+
+- `POST /v1/rsp/encode`：请求体为 `{"payload": "<偶数位十六进制>"}`，载荷可为空、上限 4096 字节，成功返回 `{"packet": "<完整数据包小写十六进制>"}`。
+- `POST /v1/rsp/decode-stream`：无状态的流解析。请求体为 `{"data": "<偶数位十六进制，解码后不超过 1048576 字节>", "eof": bool}`；调用方将上次返回的 `remainder` 与新数据拼接后再次提交。返回 `{"packets", "controls", "errors", "discarded", "remainder"}`：`packets` 每项只含起始 `0x24` 的字节 `offset` 与解转义后的小写 `payload`；候选外 `0x2b`、`0x2d` 生成 `type` 为 `ack`、`nack` 的 control；`errors` 每项只含 `offset` 与 `code`；三个数组均按 `offset` 升序。其余噪声与失败候选字节计入 `discarded`。
+
+包内未转义 `0x24` 使旧候选记 `nested_start` 并从新位置重启；校验字符非法记 `invalid_checksum`，校验不符记 `checksum_mismatch`，解转义载荷超过 4096 字节记 `invalid_length`。包级错误使用 HTTP 200，不阻断后续包。`eof=false` 时，缺 `0x23`、校验字符不足两位或末尾只有 `0x7d` 的候选从起始 `0x24` 原样进入小写 `remainder`，不报错也不丢弃；`eof=true` 时记 `truncated_packet`，全部丢弃且 `remainder` 为空。空 `data` 返回三个空数组、`0` 和空字符串。
+
+请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型或十六进制错误、`eof` 非布尔值、`data` 超限返回 `invalid_field`（HTTP 400）。
+
 ## 断点与观察点（v1）
 
 记录仅保存在当前服务进程中，重启后为空，不产生任何持久化副作用。id 为按创建顺序递增的正整数，同一进程内不复用；返回对象包含全部规范化字段（execute 无 `size`，其他类型带 `size`）。
