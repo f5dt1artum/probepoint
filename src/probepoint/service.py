@@ -16,10 +16,12 @@ from .breakpoints import (
     parse_patch,
 )
 from .frames import decode_frame, decode_stream, encode_frame
+from .rsp import decode_stream as rsp_decode_stream
+from .rsp import encode_packet
 
 
 class Service:
-    """Health reporting, the v1 frame codec and in-process breakpoints."""
+    """Health reporting, frame/RSP codecs and in-process breakpoints."""
 
     name = "probepoint"
     version = __version__
@@ -38,6 +40,12 @@ class Service:
 
     def decode_stream(self, body: object) -> dict[str, object]:
         return decode_stream(body)
+
+    def encode_rsp_packet(self, body: object) -> dict[str, str]:
+        return encode_packet(body)
+
+    def decode_rsp_stream(self, body: object) -> dict[str, object]:
+        return rsp_decode_stream(body)
 
     def create_breakpoint(self, body: object) -> dict[str, object]:
         kind, address, size, enabled = parse_create(body)
