@@ -7,7 +7,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .service import Service
+from .service import Service, ServiceError
 
 
 def env_address() -> tuple[str, int]:
@@ -29,18 +29,47 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_error_json(self, status: int, code: str, message: str) -> None:
+        self.send_json(status, {"error": {"code": code, "message": message}})
+
     def do_GET(self) -> None:
         if self.path == "/healthz":
             self.send_json(200, self.service.health())
             return
-        self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+        self.send_error_json(404, "not_found", f"no route for {self.path}")
+
+    def do_POST(self) -> None:
+        if self.path not in ("/v1/frames/encode", "/v1/frames/decode"):
+            self.send_error_json(404, "not_found", f"no route for {self.path}")
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            request = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_error_json(400, "invalid_request", "request body must be a JSON object")
+            return
+        if not isinstance(request, dict):
+            self.send_error_json(400, "invalid_request", "request body must be a JSON object")
+            return
+
+        try:
+            if self.path == "/v1/frames/encode":
+                response = self.service.encode_frame(request)
+            else:
+                response = self.service.decode_frame(request)
+        except ServiceError as exc:
+            self.send_error_json(400, exc.code, str(exc))
+            return
+        self.send_json(200, response)
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="probepoint.server", description="嵌入式调试与探针工具链")
+    parser = argparse.ArgumentParser(prog="probepoint.server", description="嵌入式调试与探针工具")
     host, port = env_address()
     parser.add_argument("--host", default=host)
     parser.add_argument("--port", type=int, default=port)
