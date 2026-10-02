@@ -21,6 +21,15 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 请求体非法返回 `error.code=invalid_request`；字段缺失、多余、类型或取值错误返回 `invalid_field`；帧解码失败按优先级返回 `truncated_frame`、`bad_magic`、`unsupported_version`、`invalid_length`、`trailing_data`、`checksum_mismatch`，均为 HTTP 400。
 
+## 流式帧解码（v1）
+
+`POST /v1/frames/decode-stream` 面向串口或 TCP 分段数据做无状态流解码，服务端不保存会话；调用方需自行把上次的 `remainder` 拼接到新数据前再次提交。
+
+- 请求体只能包含 `data` 与 `eof`：`data` 为不带前缀或分隔符的偶数位十六进制字符串，解码后不超过 1048576 字节；`eof` 为布尔值，表示确认没有后续字节。
+- 响应（HTTP 200）包含 `frames`、`errors`、`discarded`、`remainder`。`frames` 按出现顺序返回，字段与单帧解码一致并增加 `offset`（魔数在本次 `data` 中从零开始的字节偏移）；`errors` 按 `offset` 升序，每项只含 `offset` 与 `code`；`discarded` 为既未组成合法帧也未进入 `remainder` 的字节数；`remainder` 为小写十六进制，只保留等待后续数据才能判断的末尾。空 `data` 返回空数组、空数组、`0`、空字符串。
+- 解析从左向右寻找魔数 `0x5050`，之前的噪声计入 `discarded`。候选头完整后依次检查版本（`unsupported_version`）、声明长度超过 4096（`invalid_length`）与 CRC（`checksum_mismatch`）；出错不终止请求，从该魔数后的下一字节继续搜索，被跳过内容计入 `discarded`。候选数据不足时：`eof=false` 从魔数起放入 `remainder` 且不报错（末尾单独的 `0x50` 同样保留）；`eof=true` 记录 `truncated_frame` 并返回空 `remainder`，其余不能构成魔数的尾部作为噪声丢弃。
+- 请求体不是 JSON 对象返回 `invalid_request`；字段缺失、多余、类型错误、非法十六进制或超过大小限制返回 `invalid_field`，均为 HTTP 400。序列号可重复，不去重也不排序。
+
 ## 断点与观察点（v1）
 
 记录仅保存在当前服务进程中，重启后为空，不产生任何持久化副作用。id 为按创建顺序递增的正整数，同一进程内不复用；返回对象包含全部规范化字段（execute 无 `size`，其他类型带 `size`）。

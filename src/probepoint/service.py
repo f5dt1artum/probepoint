@@ -16,6 +16,7 @@ from .breakpoints import (
     parse_patch,
 )
 from .frames import decode_frame, encode_frame
+from .stream import decode_stream
 
 
 class Service:
@@ -35,6 +36,9 @@ class Service:
 
     def decode_frame(self, body: object) -> dict[str, object]:
         return decode_frame(body)
+
+    def decode_stream(self, body: object) -> dict[str, object]:
+        return decode_stream(body)
 
     def create_breakpoint(self, body: object) -> dict[str, object]:
         kind, address, size, enabled = parse_create(body)
