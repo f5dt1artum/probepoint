@@ -20,6 +20,7 @@ import zlib
 MAGIC = 0x5050
 VERSION = 1
 MAX_PAYLOAD = 4096
+MAX_STREAM_DATA = 1 << 20  # 1 MiB per decode-stream request
 
 HEADER_LEN = 12  # magic(2) version(1) flags(1) sequence(4) opcode(2) length(2)
 CRC_LEN = 4
@@ -116,4 +117,115 @@ def decode_frame(body: object) -> dict[str, object]:
         "sequence": sequence,
         "opcode": opcode,
         "payload": payload.hex(),
+    }
+
+
+def decode_stream(body: object) -> dict[str, object]:
+    """Validate a decode-stream request and scan one stateless byte fragment.
+
+    The fragment carries no session state: callers resubmit the previously
+    returned ``remainder`` concatenated with fresh bytes. Frames and errors
+    are reported as they appear; bytes that start no frame are counted as
+    ``discarded`` unless they may still complete with future data, in which
+    case they form the ``remainder``.
+    """
+    fields = _check_fields(body, frozenset({"data", "eof"}))
+    if not isinstance(fields["eof"], bool):
+        raise FrameError("invalid_field", "eof must be a boolean")
+    data = _hex_bytes(fields["data"], "data")
+    if len(data) > MAX_STREAM_DATA:
+        raise FrameError("invalid_field", f"data exceeds {MAX_STREAM_DATA} decoded bytes")
+
+    frames: list[dict[str, object]] = []
+    errors: list[dict[str, object]] = []
+    discarded = 0
+
+    n = len(data)
+    i = 0
+    while i < n:
+        # Find the next magic candidate; preceding bytes are line noise.
+        if data[i] != 0x50:
+            discarded += 1
+            i += 1
+            continue
+        if i + 1 >= n:
+            # Lone trailing 0x50: keep it as a potential magic start while
+            # more bytes may arrive; at end of stream it is a truncated
+            # candidate rather than plain noise.
+            if fields["eof"]:
+                errors.append({"offset": i, "code": "truncated_frame"})
+                discarded += 1
+                i += 1
+            break
+        if data[i + 1] != 0x50:
+            discarded += 1
+            i += 1
+            continue
+
+        offset = i
+
+        # A full header is needed to learn the declared payload length.
+        if n - i < HEADER_LEN:
+            if fields["eof"]:
+                errors.append({"offset": offset, "code": "truncated_frame"})
+                discarded += n - i
+                i = n
+            else:
+                # Candidate might complete once more bytes arrive.
+                break
+            continue
+
+        _magic, version, _flags, _sequence, _opcode, length = _HEADER.unpack(
+            data[i : i + HEADER_LEN]
+        )
+        if version != VERSION:
+            # Deterministic header failure: resync one byte past the magic.
+            errors.append({"offset": offset, "code": "unsupported_version"})
+            discarded += 1
+            i += 1
+            continue
+        if length > MAX_PAYLOAD:
+            errors.append({"offset": offset, "code": "invalid_length"})
+            discarded += 1
+            i += 1
+            continue
+
+        total = HEADER_LEN + length + CRC_LEN
+        if n - i < total:
+            if fields["eof"]:
+                errors.append({"offset": offset, "code": "truncated_frame"})
+                discarded += n - i
+                i = n
+            else:
+                # Wait for the declared payload and CRC before judging it.
+                break
+            continue
+
+        chunk = data[i : i + total]
+        (crc_expected,) = _UINT32.unpack(chunk[HEADER_LEN + length : total])
+        crc_actual = zlib.crc32(chunk[2 : HEADER_LEN + length])
+        if crc_actual != crc_expected:
+            errors.append({"offset": offset, "code": "checksum_mismatch"})
+            discarded += 1
+            i += 1
+            continue
+
+        frames.append(
+            {
+                "offset": offset,
+                "version": version,
+                "flags": _flags,
+                "sequence": _sequence,
+                "opcode": _opcode,
+                "payload": chunk[HEADER_LEN : HEADER_LEN + length].hex(),
+            }
+        )
+        i += total
+
+    remainder = data[i:] if not fields["eof"] else b""
+    return {
+        "frames": frames,
+        "errors": errors,
+        "discarded": discarded,
+        "remainder": remainder.hex(),
     }
