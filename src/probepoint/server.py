@@ -7,6 +7,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .frames import FrameError
 from .service import Service
 
 
@@ -35,8 +36,38 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
+    def do_POST(self) -> None:
+        routes = {
+            "/v1/frames/encode": self.service.encode_frame,
+            "/v1/frames/decode": self.service.decode_frame,
+        }
+        handler = routes.get(self.path)
+        if handler is None:
+            self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            body = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_json(400, {"error": {"code": "invalid_request", "message": "request body is not valid JSON"}})
+            return
+        try:
+            result = handler(body)
+        except FrameError as exc:
+            self.send_json(400, {"error": {"code": exc.code, "message": exc.message}})
+            return
+        self.send_json(200, result)
+
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""
+
+
+def make_server(host: str, port: int) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), Handler)
 
 
 def main() -> int:
@@ -45,7 +76,7 @@ def main() -> int:
     parser.add_argument("--host", default=host)
     parser.add_argument("--port", type=int, default=port)
     args = parser.parse_args()
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    httpd = make_server(args.host, args.port)
     print(f"ProbePoint listening on http://{args.host}:{httpd.server_address[1]}", flush=True)
     try:
         httpd.serve_forever()
