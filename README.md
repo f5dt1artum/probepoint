@@ -21,6 +21,17 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 请求体非法返回 `error.code=invalid_request`；字段缺失、多余、类型或取值错误返回 `invalid_field`；帧解码失败按优先级返回 `truncated_frame`、`bad_magic`、`unsupported_version`、`invalid_length`、`trailing_data`、`checksum_mismatch`，均为 HTTP 400。
 
+## 断点与观察点（v1）
+
+记录仅保存在当前服务进程中，重启后为空，不产生任何持久化副作用。id 为按创建顺序递增的正整数，同一进程内删除后也不复用。
+
+- `POST /v1/breakpoints`：请求体为 `{"kind": "execute|read|write|access", "address": u32, "enabled": bool, "size"?: 1|2|4|8}`。`execute` 不得携带 `size`（响应中为 `null`）；其余类型必须携带 `size`，且 `address` 按 `size` 对齐。成功返回 HTTP 201 和包含全部规范化字段（含 `id`）的对象。
+- `GET /v1/breakpoints`：返回按 `id` 升序的记录数组，可用 `kind`、`enabled=true|false` 查询参数联合筛选。
+- `PATCH /v1/breakpoints/{id}`：请求体只能是 `{"enabled": bool}`，返回更新后的对象。
+- `DELETE /v1/breakpoints/{id}`：删除记录，返回 `{"deleted": id}`。
+
+错误码：请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型错误、数值越界、`execute` 携带 `size`、观察点缺少 `size` 或地址未对齐返回 `invalid_field`（HTTP 400，且字段校验先于重复检查）；`kind/address/size` 相同的记录重复创建（与 `enabled` 无关）返回 `duplicate_breakpoint`（HTTP 409）；查询参数未知、重复或取值非法返回 `invalid_query`（HTTP 400）；路径 id 不是十进制正整数返回 `invalid_breakpoint_id`（HTTP 400）；不存在的正整数 id 返回 `breakpoint_not_found`（HTTP 404）。
+
 ## 验证
 
 ```bash

@@ -8,14 +8,18 @@ surface here backward compatible.
 from __future__ import annotations
 
 from . import __version__
+from .breakpoints import BreakpointStore
 from .frames import decode_frame, encode_frame
 
 
 class Service:
-    """Health reporting plus the v1 debug protocol frame codec."""
+    """Health reporting, the v1 frame codec and v1 breakpoint management."""
 
     name = "probepoint"
     version = __version__
+
+    def __init__(self) -> None:
+        self.breakpoints = BreakpointStore()
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}

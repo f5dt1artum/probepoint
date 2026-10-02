@@ -6,9 +6,14 @@ import argparse
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
+from .breakpoints import BreakpointError
 from .frames import FrameError
 from .service import Service
+
+COLLECTION_PATH = "/v1/breakpoints"
+ITEM_PREFIX = "/v1/breakpoints/"
 
 
 def env_address() -> tuple[str, int]:
@@ -22,7 +27,7 @@ def env_address() -> tuple[str, int]:
 class Handler(BaseHTTPRequestHandler):
     service = Service()
 
-    def send_json(self, status: int, payload: dict) -> None:
+    def send_json(self, status: int, payload: object) -> None:
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -30,35 +35,93 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self) -> None:
-        if self.path == "/healthz":
-            self.send_json(200, self.service.health())
-            return
+    def send_error_body(self, exc: FrameError | BreakpointError) -> None:
+        status = getattr(exc, "status", 400)
+        self.send_json(status, {"error": {"code": exc.code, "message": exc.message}})
+
+    def not_found(self) -> None:
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
-    def do_POST(self) -> None:
-        routes = {
-            "/v1/frames/encode": self.service.encode_frame,
-            "/v1/frames/decode": self.service.decode_frame,
-        }
-        handler = routes.get(self.path)
-        if handler is None:
-            self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
-            return
+    def read_json_body(self) -> object:
+        """Return the parsed JSON body, raising ValueError on malformed input."""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
         raw = self.rfile.read(length) if length > 0 else b""
-        try:
-            body = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self.send_json(400, {"error": {"code": "invalid_request", "message": "request body is not valid JSON"}})
+        return json.loads(raw.decode("utf-8"))
+
+    def do_GET(self) -> None:
+        if self.path == "/healthz":
+            self.send_json(200, self.service.health())
+            return
+        parts = urlsplit(self.path)
+        if parts.path == COLLECTION_PATH:
+            try:
+                result = self.service.breakpoints.list(parts.query)
+            except BreakpointError as exc:
+                self.send_error_body(exc)
+                return
+            self.send_json(200, result)
+            return
+        self.not_found()
+
+    def do_POST(self) -> None:
+        # Frame routes keep the baseline's exact (query-less) path matching.
+        if self.path == "/v1/frames/encode":
+            handler: object = self.service.encode_frame
+            status = 200
+        elif self.path == "/v1/frames/decode":
+            handler = self.service.decode_frame
+            status = 200
+        elif urlsplit(self.path).path == COLLECTION_PATH:
+            handler = self.service.breakpoints.create
+            status = 201
+        else:
+            self.not_found()
             return
         try:
-            result = handler(body)
-        except FrameError as exc:
-            self.send_json(400, {"error": {"code": exc.code, "message": exc.message}})
+            body = self.read_json_body()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_json(
+                400, {"error": {"code": "invalid_request", "message": "request body is not valid JSON"}}
+            )
+            return
+        try:
+            result = handler(body)  # type: ignore[operator]
+        except (FrameError, BreakpointError) as exc:
+            self.send_error_body(exc)
+            return
+        self.send_json(status, result)
+
+    def do_PATCH(self) -> None:
+        parts = urlsplit(self.path)
+        if not parts.path.startswith(ITEM_PREFIX):
+            self.not_found()
+            return
+        try:
+            body = self.read_json_body()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_json(
+                400, {"error": {"code": "invalid_request", "message": "request body is not valid JSON"}}
+            )
+            return
+        try:
+            result = self.service.breakpoints.set_enabled(parts.path[len(ITEM_PREFIX) :], body)
+        except BreakpointError as exc:
+            self.send_error_body(exc)
+            return
+        self.send_json(200, result)
+
+    def do_DELETE(self) -> None:
+        parts = urlsplit(self.path)
+        if not parts.path.startswith(ITEM_PREFIX):
+            self.not_found()
+            return
+        try:
+            result = self.service.breakpoints.delete(parts.path[len(ITEM_PREFIX) :])
+        except BreakpointError as exc:
+            self.send_error_body(exc)
             return
         self.send_json(200, result)
 
