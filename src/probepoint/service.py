@@ -17,6 +17,7 @@ from .breakpoints import (
     parse_patch,
 )
 from .frames import decode_frame, decode_stream, encode_frame
+from .itm import decode_stream as itm_decode_stream
 from .rsp import decode_command_response
 from .rsp import decode_stream as rsp_decode_stream
 from .rsp import encode_command
@@ -44,6 +45,9 @@ class Service:
 
     def decode_stream(self, body: object) -> dict[str, object]:
         return decode_stream(body)
+
+    def decode_itm_stream(self, body: object) -> dict[str, object]:
+        return itm_decode_stream(body)
 
     def encode_rsp_packet(self, body: object) -> dict[str, str]:
         return encode_packet(body)

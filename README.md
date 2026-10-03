@@ -63,6 +63,16 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型或取值范围错误、十六进制格式错误、写操作或执行操作携带期望长度、`continue`/`single_step` 的 `address` 类型或范围错误返回 `invalid_field`（HTTP 400）；回复含非法字符、被截断、长度与期望不符，成功形式与 `operation` 不符（如读取收到 `OK`、写入收到数据），或执行回复出现未知前缀、`OK`、位数错误/含非十六进制内容的 `S`/`T`/`W`/`X`/`E`、奇数位或非十六进制的 `O` 数据、`T` 字段缺少冒号、键或值为空、含非 ASCII 内容，返回 `invalid_response`（HTTP 400）。
 
+## ARM ITM 跟踪流解码
+
+`POST /v1/trace/itm/decode-stream` 是无状态入口：不连接目标、不保存会话，也不修改断点状态。请求体为 `{"data": "<偶数位十六进制，解码后不超过 1048576 字节>", "eof": bool}`，调用方将上次返回的 `remainder` 与新片段拼接后再次提交。返回 `{"events", "errors", "discarded", "remainder"}`；空 `data` 合法，返回两个空数组、`0` 和空字符串。
+
+源数据包头字节低两位为 `1`/`2`/`3` 时载荷长 1/2/4 字节，第三位为 `0` 表示 `software`、为 `1` 表示 `hardware`，高五位为端口号 0 至 31。源事件含 `offset`、`type=source`、`source`、`port`、`size` 与按原序排列的小写 `data`。至少五个 `0x00` 后遇 `0x80` 时，最后五个零与 `0x80` 组成 `sync` 事件，之前的零为填充；少于五个零时只为 `0x80` 记录 `unsupported_packet`。`0x70` 生成 `overflow` 事件；`sync` 与 `overflow` 只含 `offset`、`type`。其余低两位为 `0` 的字节记录 `unsupported_packet`，再从下一字节继续。`events` 与 `errors` 均按 `offset` 升序，`offset` 为事件或错误首字节在本次 `data` 中从零开始的字节偏移；`errors` 每项只含 `offset` 与 `code`，流内错误随 HTTP 200 返回且不阻断后续合法事件。`discarded` 统计填充与错误消耗的字节，不含成功事件与 `remainder`。
+
+载荷不足且 `eof=false` 时从头字节起进入 `remainder`，不报错；`eof=true` 时记 `truncated_packet`，候选计入 `discarded` 并清空 `remainder`。末尾零串在 `eof=false` 时最多保留最后五个，多余部分计入 `discarded`；`eof=true` 时全部丢弃。
+
+请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型错误、非法十六进制或 `data` 超限返回 `invalid_field`（HTTP 400）。
+
 ## 离线栈回溯（ARM Cortex-M）
 
 `POST /v1/backtrace` 根据停机快照离线展开小端 32 位帧指针链，不连接目标、不保存会话，也不修改断点状态。请求体为 `{"pc": u32, "sp": u32, "frame_pointer": u32, "stack_base": u32, "stack": "<偶数位十六进制，解码后不超过 1048576 字节>", "symbols": [...], "max_frames"?: 1..256}`；`max_frames` 缺省为 64。`stack` 是地址从 `stack_base` 开始的内存快照，其覆盖区间不得越过 `0xffffffff`。`symbols` 每项为 `{"name": "<非空字符串>", "start": u32, "end": u32}`，区间须满足 `start < end` 且互不重叠（相邻允许）。
