@@ -24,6 +24,16 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 请求体非法返回 `error.code=invalid_request`；字段缺失、多余、类型或取值错误返回 `invalid_field`；单帧解码失败按优先级返回 `truncated_frame`、`bad_magic`、`unsupported_version`、`invalid_length`、`trailing_data`、`checksum_mismatch`，均为 HTTP 400。
 
+## ARM ITM 跟踪流解码
+
+源数据包头字节：低两位为载荷长度码（1/2/3 对应 1/2/4 字节），第三位为来源（0 软件、1 硬件），高五位为端口号 0–31。`0x00` 为填充，至少五个 `0x00` 后接 `0x80` 组成同步包，`0x70` 为溢出包。
+
+- `POST /v1/trace/itm/decode-stream`：无状态的流解码，不连接目标、不修改断点状态。请求体为 `{"data": "<偶数位十六进制，解码后不超过 1048576 字节>", "eof": bool}`，调用方将上次返回的 `remainder` 与新数据拼接后再次提交，服务端不保存会话。返回 `{"events", "errors", "discarded", "remainder"}`：`events` 按 `offset`（首字节在本次 data 中从零开始的偏移）升序，源事件含 `offset`、`type=source`、`source`、`port`、`size` 与原序小写 `data`，同步与溢出事件只含 `offset` 与 `type`；`errors` 按 `offset` 升序，每项只含 `offset` 与 `code`；`discarded` 为填充与错误消耗的字节数，不含成功事件与 `remainder`；`remainder` 为小写十六进制。空 `data` 合法，返回两个空数组、`0` 和空字符串。
+
+解析从左向右进行。不足五个零后接的 `0x80` 以及其余低两位为 0 的字节记 `unsupported_packet`（消耗的字节计入 `discarded`），从下一字节继续；流内错误随 HTTP 200 返回，不阻断后续合法事件。载荷不足且 `eof=false` 时从头字节起进入 `remainder`，不报错；`eof=true` 时记 `truncated_packet`，候选计入 `discarded` 且 `remainder` 为空。末尾零串在 `eof=false` 时最多保留最后五个作为潜在同步前缀，多余部分计入 `discarded`；`eof=true` 时全部丢弃。
+
+请求体非法返回 `error.code=invalid_request`（HTTP 400）；字段缺失、多余、类型错误、非法十六进制或 `data` 超限返回 `invalid_field`（HTTP 400）。
+
 ## GDB RSP 数据包编解码
 
 线上数据包布局：`0x24`（`$`）+ 线上载荷 + `0x23`（`#`）+ 两位小写十六进制校验和。载荷中的 `0x24`、`0x23`、`0x7d`、`0x2a` 一律转义为 `0x7d` 后跟原值异或 `0x20`；校验和为转义后线上载荷字节之和模 256。
