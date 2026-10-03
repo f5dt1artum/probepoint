@@ -63,6 +63,14 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型或取值范围错误、十六进制格式错误、写操作或执行操作携带期望长度、`continue`/`single_step` 的 `address` 类型或范围错误返回 `invalid_field`（HTTP 400）；回复含非法字符、被截断、长度与期望不符，成功形式与 `operation` 不符（如读取收到 `OK`、写入收到数据），或执行回复出现未知前缀、`OK`、位数错误/含非十六进制内容的 `S`/`T`/`W`/`X`/`E`、奇数位或非十六进制的 `O` 数据、`T` 字段缺少冒号、键或值为空、含非 ASCII 内容，返回 `invalid_response`（HTTP 400）。
 
+## 离线栈回溯（v1）
+
+`POST /v1/backtrace` 针对 ARM Cortex-M 的小端 32 位帧指针记录做纯离线栈回溯：不连接目标、不保存会话，也不读取或修改断点状态。请求体字段为 `{"pc": u32, "sp": u32, "frame_pointer": u32, "stack_base": u32, "stack": "<偶数位十六进制，解码后不超过 1048576 字节>", "symbols": [{"name": "<非空字符串>", "start": u32, "end": u32}], "max_frames"?: 1..256}`。`stack` 覆盖区间 `[stack_base, stack_base + 字节数)` 不得越过 `0xffffffff`；符号区间须满足 `start < end` 且互不重叠（相邻允许）；`max_frames` 缺省为 64。
+
+成功返回 HTTP 200 与 `{"frames", "stop_reason"}`。首帧取 `pc` 清除最低 Thumb 位后的地址以及输入的 `sp`、`frame_pointer`；随后在当前帧指针处读取 8 字节小端记录，前四字节为上一帧指针、后四字节为保存的 LR，调用者地址为 LR 清除最低位，`sp` 为当前帧指针加 8。每帧包含 `level`、`address`、`sp`、`frame_pointer`、`symbol`、`offset`；地址落入某符号的 `[start, end)` 区间时给出符号名与相对偏移，否则二者为 JSON `null`。`stop_reason` 取值：帧指针归零为 `complete`，达到 `max_frames` 为 `max_frames`，指针未四字节对齐、链条未严格向高地址推进或成环为 `invalid_chain`（保留已完成帧），记录未完整落入快照为 `stack_exhausted`（不输出只读取一部分的帧）。
+
+请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型或取值范围错误、非法十六进制、栈地址溢出、非法或重叠的符号区间返回 `invalid_field`（HTTP 400）。结构合法但无法继续展开时按上述 `stop_reason` 返回部分结果（HTTP 200）。
+
 ## 断点与观察点（v1）
 
 记录仅保存在当前服务进程中，重启后为空，不产生任何持久化副作用。id 为按创建顺序递增的正整数，同一进程内不复用；返回对象包含全部规范化字段（execute 无 `size`，其他类型带 `size`）。
@@ -80,4 +88,4 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-栈回溯等后续能力仍刻意未实现，以便后续任务从已冻结事实出发独立设计并验证这些能力。
+符号解析、内存与寄存器读写、跟踪缓冲等后续能力仍刻意未实现，以便后续任务从已冻结事实出发独立设计并验证这些能力。

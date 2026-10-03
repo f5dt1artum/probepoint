@@ -9,6 +9,7 @@ backward compatible.
 from __future__ import annotations
 
 from . import __version__
+from .backtrace import backtrace
 from .breakpoints import (
     BreakpointStore,
     parse_create,
@@ -54,6 +55,9 @@ class Service:
 
     def decode_rsp_command_response(self, body: object) -> dict[str, object]:
         return decode_command_response(body)
+
+    def backtrace(self, body: object) -> dict[str, object]:
+        return backtrace(body)
 
     def create_breakpoint(self, body: object) -> dict[str, object]:
         kind, address, size, enabled = parse_create(body)

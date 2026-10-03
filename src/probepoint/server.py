@@ -8,6 +8,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+from .backtrace import BacktraceError
 from .breakpoints import BreakpointError, parse_breakpoint_id
 from .frames import FrameError
 from .rsp import RspError
@@ -95,6 +96,7 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/rsp/decode-stream": self.service.decode_rsp_stream,
             "/v1/rsp/commands/encode": self.service.encode_rsp_command,
             "/v1/rsp/commands/decode-response": self.service.decode_rsp_command_response,
+            "/v1/backtrace": self.service.backtrace,
         }
         handler = routes.get(self.path)
         if handler is None:
@@ -105,7 +107,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             result = handler(body)
-        except (FrameError, RspError) as exc:
+        except (FrameError, RspError, BacktraceError) as exc:
             self.send_error_json(400, exc.code, exc.message)
             return
         self.send_json(200, result)
