@@ -16,6 +16,9 @@ READ_REGISTER = "read_register"
 WRITE_REGISTER = "write_register"
 CONTINUE = "continue"
 SINGLE_STEP = "single_step"
+FLASH_ERASE = "flash_erase"
+FLASH_WRITE = "flash_write"
+FLASH_DONE = "flash_done"
 
 
 def ascii_hex(text: str) -> str:
@@ -280,6 +283,184 @@ class EncodeExecutionCommandTest(RspCommandsHttpTest):
                 self.assertEqual(resp["error"]["code"], "invalid_field")
 
 
+class EncodeFlashCommandTest(RspCommandsHttpTest):
+    def test_flash_erase_basic(self) -> None:
+        status, body = self.encode(
+            {"operation": FLASH_ERASE, "address": 0x1000, "length": 0x2000}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"vFlashErase:1000,2000")
+
+    def test_flash_erase_numbers_bare_lowercase_hex(self) -> None:
+        status, body = self.encode(
+            {"operation": FLASH_ERASE, "address": 10, "length": 255}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"vFlashErase:a,ff")
+
+    def test_flash_erase_length_max_and_full_space(self) -> None:
+        # length spans the whole u32 range starting at address 0.
+        status, body = self.encode(
+            {"operation": FLASH_ERASE, "address": 0, "length": 0xFFFFFFFF}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"vFlashErase:0,ffffffff")
+        # Half-open interval ending exactly on 0xffffffff is allowed.
+        status, body = self.encode(
+            {"operation": FLASH_ERASE, "address": 0xFFFFFFFE, "length": 1}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"vFlashErase:fffffffe,1")
+
+    def test_flash_erase_errors(self) -> None:
+        cases = [
+            {"operation": FLASH_ERASE, "address": 0, "length": 0},
+            {"operation": FLASH_ERASE, "address": 0, "length": 1 << 32},
+            {"operation": FLASH_ERASE, "address": -1, "length": 1},
+            {"operation": FLASH_ERASE, "address": 1 << 32, "length": 1},
+            {"operation": FLASH_ERASE, "address": True, "length": 1},
+            {"operation": FLASH_ERASE, "address": 0, "length": True},
+            {"operation": FLASH_ERASE, "address": 0, "length": "1"},
+            {"operation": FLASH_ERASE, "address": 0xFFFFFFFF, "length": 1},
+            {"operation": FLASH_ERASE, "address": 0, "length": 0xFFFFFFFF + 1},
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                status, resp = self.encode(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_field")
+
+    def test_flash_erase_rejects_extra_and_missing_fields(self) -> None:
+        cases = [
+            {"operation": FLASH_ERASE, "address": 0},
+            {"operation": FLASH_ERASE, "length": 1},
+            {"operation": FLASH_ERASE, "address": 0, "length": 1, "data": "ab"},
+            {"operation": FLASH_ERASE, "address": 0, "length": 1, "extra": 1},
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                status, resp = self.encode(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_field")
+
+    def test_flash_write_basic(self) -> None:
+        status, body = self.encode(
+            {"operation": FLASH_WRITE, "address": 0x100, "data": "cafe"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"vFlashWrite:100:" + bytes.fromhex("cafe"))
+
+    def test_flash_write_address_zero(self) -> None:
+        status, body = self.encode(
+            {"operation": FLASH_WRITE, "address": 0, "data": "00ff"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"vFlashWrite:0:\x00\xff")
+
+    def test_flash_write_special_bytes_are_raw_not_escaped(self) -> None:
+        # 0x00 and the RSP-special bytes 0x24 '$', 0x23 '#', 0x7d '}',
+        # 0x2a '*' stay as-is in the command payload; only the packet
+        # codec escapes them.
+        status, body = self.encode(
+            {"operation": FLASH_WRITE, "address": 0, "data": "0024237d2a"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["payload"], (b"vFlashWrite:0:" + bytes([0x00, 0x24, 0x23, 0x7D, 0x2A])).hex())
+
+    def test_flash_write_payload_limit(self) -> None:
+        prefix = len("vFlashWrite:0:")
+        data = "ab" * (4096 - prefix)
+        status, body = self.encode({"operation": FLASH_WRITE, "address": 0, "data": data})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(bytes.fromhex(body["payload"])), 4096)
+
+        status, resp = self.encode(
+            {"operation": FLASH_WRITE, "address": 0, "data": "ab" * (4096 - prefix + 1)}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(resp["error"]["code"], "invalid_field")
+
+    def test_flash_write_address_boundary(self) -> None:
+        # Half-open interval ending exactly on 0xffffffff is allowed.
+        status, body = self.encode(
+            {"operation": FLASH_WRITE, "address": 0xFFFFFFFE, "data": "ff"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"vFlashWrite:fffffffe:\xff")
+
+    def test_flash_write_errors(self) -> None:
+        cases = [
+            {"operation": FLASH_WRITE, "address": 0xFFFFFFFF, "data": "ff"},
+            {"operation": FLASH_WRITE, "address": 0xFFFFFFFF, "data": "0000"},
+            {"operation": FLASH_WRITE, "address": 0xFFFFFFFE, "data": "000000"},
+            {"operation": FLASH_WRITE, "address": 0, "data": ""},
+            {"operation": FLASH_WRITE, "address": 0, "data": "abc"},
+            {"operation": FLASH_WRITE, "address": 0, "data": "0xab"},
+            {"operation": FLASH_WRITE, "address": 0, "data": "zz"},
+            {"operation": FLASH_WRITE, "address": -1, "data": "ab"},
+            {"operation": FLASH_WRITE, "address": 1 << 32, "data": "ab"},
+            {"operation": FLASH_WRITE, "address": True, "data": "ab"},
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                status, resp = self.encode(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_field")
+
+    def test_flash_write_rejects_extra_and_missing_fields(self) -> None:
+        cases = [
+            {"operation": FLASH_WRITE, "address": 0},
+            {"operation": FLASH_WRITE, "data": "ab"},
+            {"operation": FLASH_WRITE, "address": 0, "data": "ab", "length": 1},
+            {"operation": FLASH_WRITE, "address": 0, "data": "ab", "extra": 1},
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                status, resp = self.encode(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_field")
+
+    def test_flash_done_basic(self) -> None:
+        status, body = self.encode({"operation": FLASH_DONE})
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"vFlashDone")
+
+    def test_flash_done_rejects_extra_fields(self) -> None:
+        for body in (
+            {"operation": FLASH_DONE, "address": 0},
+            {"operation": FLASH_DONE, "length": 1},
+            {"operation": FLASH_DONE, "data": "ab"},
+            {"operation": FLASH_DONE, "extra": 1},
+        ):
+            with self.subTest(body=body):
+                status, resp = self.encode(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_field")
+
+    def test_flash_payload_round_trips_through_packet_codec(self) -> None:
+        # vFlashWrite raw special bytes get escaped by the packet codec and
+        # decode back to the exact same command payload.
+        status, enc = self.encode(
+            {"operation": FLASH_WRITE, "address": 0x42, "data": "0024237d2a"}
+        )
+        self.assertEqual(status, 200)
+        command_payload = enc["payload"]
+        status, packet = self.call(PACKET_ENCODE_PATH, {"payload": command_payload})
+        self.assertEqual(status, 200)
+        status, stream = self.call(STREAM_PATH, {"data": packet["packet"], "eof": True})
+        self.assertEqual(status, 200)
+        self.assertEqual([p["payload"] for p in stream["packets"]], [command_payload])
+
+        status, enc = self.encode({"operation": FLASH_DONE})
+        self.assertEqual(status, 200)
+        command_payload = enc["payload"]
+        status, packet = self.call(PACKET_ENCODE_PATH, {"payload": command_payload})
+        self.assertEqual(status, 200)
+        status, stream = self.call(STREAM_PATH, {"data": packet["packet"], "eof": True})
+        self.assertEqual(status, 200)
+        self.assertEqual([p["payload"] for p in stream["packets"]], [command_payload])
+
+
 class DecodeCommandResponseTest(RspCommandsHttpTest):
     def test_empty_payload_is_unsupported(self) -> None:
         for body in (
@@ -422,6 +603,100 @@ class DecodeCommandResponseTest(RspCommandsHttpTest):
                 status, resp = self.respond(body)
                 self.assertEqual(status, 400)
                 self.assertEqual(resp["error"]["code"], "invalid_response")
+
+    def test_not_json_object(self) -> None:
+        for raw in (b"not json", b"[1, 2]", b'"text"', b"42", b"null"):
+            with self.subTest(raw=raw):
+                status, resp = self.post(RESPONSE_PATH, raw)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_request")
+
+
+class DecodeFlashResponseTest(RspCommandsHttpTest):
+    def test_empty_payload_is_unsupported(self) -> None:
+        for operation in (FLASH_ERASE, FLASH_WRITE, FLASH_DONE):
+            with self.subTest(operation=operation):
+                status, resp = self.respond({"operation": operation, "payload": ""})
+                self.assertEqual(status, 200)
+                self.assertEqual(resp, {"status": "unsupported"})
+
+    def test_ok(self) -> None:
+        for operation in (FLASH_ERASE, FLASH_WRITE, FLASH_DONE):
+            with self.subTest(operation=operation):
+                status, resp = self.respond(
+                    {"operation": operation, "payload": ascii_hex("OK")}
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(resp, {"status": "ok"})
+
+    def test_error_code_lowercased(self) -> None:
+        for operation, reply in (
+            (FLASH_ERASE, "E01"),
+            (FLASH_WRITE, "EAF"),
+            (FLASH_DONE, "Eff"),
+        ):
+            with self.subTest(operation=operation):
+                status, resp = self.respond(
+                    {"operation": operation, "payload": ascii_hex(reply)}
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(resp, {"status": "error", "code": reply[1:].lower()})
+
+    def test_invalid_responses(self) -> None:
+        cases = [
+            # Any non-OK data reply is rejected.
+            ascii_hex("abcd"),
+            # Malformed E replies: truncated, non-hex code, extra byte.
+            ascii_hex("E0"),
+            ascii_hex("Ezz"),
+            ascii_hex("E012"),
+            # Exact uppercase ASCII OK only.
+            ascii_hex("ok"),
+            ascii_hex("OK!"),
+            ascii_hex(" OK"),
+            # Non-ASCII payload bytes.
+            "80",
+            "4f80",
+        ]
+        for operation in (FLASH_ERASE, FLASH_WRITE, FLASH_DONE):
+            for payload in cases:
+                with self.subTest(operation=operation, payload=payload):
+                    status, resp = self.respond(
+                        {"operation": operation, "payload": payload}
+                    )
+                    self.assertEqual(status, 400)
+                    self.assertEqual(resp["error"]["code"], "invalid_response")
+
+    def test_fields_only_operation_and_payload(self) -> None:
+        good = {"operation": FLASH_WRITE, "payload": ascii_hex("OK")}
+        status, _ = self.respond(good)
+        self.assertEqual(status, 200)
+        for body in (
+            {},
+            {"payload": ascii_hex("OK")},
+            {"operation": FLASH_ERASE},
+            {"operation": FLASH_DONE, "payload": "", "expected_length": 1},
+            {"operation": FLASH_WRITE, "payload": ascii_hex("OK"), "expected_size": 1},
+            {"operation": FLASH_DONE, "payload": "", "address": 0},
+            {"operation": FLASH_DONE, "payload": "", "data": "ab"},
+            {"operation": FLASH_DONE, "payload": "", "extra": 1},
+            {"operation": "flash_reset", "payload": ""},
+            {"operation": 9, "payload": ""},
+        ):
+            with self.subTest(body=body):
+                status, resp = self.respond(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_field")
+
+    def test_outer_payload_hex_errors_are_invalid_field(self) -> None:
+        for payload in ("abc", "zz", "0x4f"):
+            for operation in (FLASH_ERASE, FLASH_WRITE, FLASH_DONE):
+                with self.subTest(operation=operation, payload=payload):
+                    status, resp = self.respond(
+                        {"operation": operation, "payload": payload}
+                    )
+                    self.assertEqual(status, 400)
+                    self.assertEqual(resp["error"]["code"], "invalid_field")
 
     def test_not_json_object(self) -> None:
         for raw in (b"not json", b"[1, 2]", b'"text"', b"42", b"null"):

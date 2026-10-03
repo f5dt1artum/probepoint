@@ -23,10 +23,16 @@ READ_REGISTER = "read_register"
 WRITE_REGISTER = "write_register"
 CONTINUE = "continue"
 SINGLE_STEP = "single_step"
+FLASH_ERASE = "flash_erase"
+FLASH_WRITE = "flash_write"
+FLASH_DONE = "flash_done"
 _READ_OPERATIONS = frozenset({READ_MEMORY, READ_REGISTER})
 _WRITE_OPERATIONS = frozenset({WRITE_MEMORY, WRITE_REGISTER})
 _EXECUTION_OPERATIONS = frozenset({CONTINUE, SINGLE_STEP})
-_COMMAND_OPERATIONS = _READ_OPERATIONS | _WRITE_OPERATIONS | _EXECUTION_OPERATIONS
+_FLASH_OPERATIONS = frozenset({FLASH_ERASE, FLASH_WRITE, FLASH_DONE})
+_COMMAND_OPERATIONS = (
+    _READ_OPERATIONS | _WRITE_OPERATIONS | _EXECUTION_OPERATIONS | _FLASH_OPERATIONS
+)
 
 DOLLAR = 0x24  # '$' packet start
 HASH = 0x23  # '#' payload/checksum separator
@@ -218,6 +224,9 @@ _ENCODE_FIELDS = {
     WRITE_REGISTER: frozenset({"operation", "register", "value"}),
     CONTINUE: frozenset({"operation"}),
     SINGLE_STEP: frozenset({"operation"}),
+    FLASH_ERASE: frozenset({"operation", "address", "length"}),
+    FLASH_WRITE: frozenset({"operation", "address", "data"}),
+    FLASH_DONE: frozenset({"operation"}),
 }
 _ENCODE_OPTIONAL = {
     CONTINUE: frozenset({"address"}),
@@ -230,6 +239,9 @@ _RESPONSE_FIELDS = {
     WRITE_REGISTER: frozenset({"operation", "payload"}),
     CONTINUE: frozenset({"operation", "payload"}),
     SINGLE_STEP: frozenset({"operation", "payload"}),
+    FLASH_ERASE: frozenset({"operation", "payload"}),
+    FLASH_WRITE: frozenset({"operation", "payload"}),
+    FLASH_DONE: frozenset({"operation", "payload"}),
 }
 _ADDRESS_MAX = 0xFFFFFFFF
 
@@ -275,6 +287,9 @@ def encode_command(body: object) -> dict[str, str]:
     """
     operation, fields = _operation_fields(body, _ENCODE_FIELDS, _ENCODE_OPTIONAL)
 
+    if operation in _FLASH_OPERATIONS:
+        return _encode_flash_command(operation, fields)
+
     if operation == READ_MEMORY:
         address = _uint(fields["address"], 32, "address")
         length = _uint(fields["length"], 32, "length")
@@ -311,6 +326,37 @@ def encode_command(body: object) -> dict[str, str]:
             command = letter + f"{address:x}".encode("ascii")
         else:
             command = letter
+
+    return {"payload": command.hex()}
+
+
+def _encode_flash_command(operation: str, fields: dict) -> dict[str, str]:
+    """Encode a stateless vFlashErase/vFlashWrite/vFlashDone payload.
+
+    The flash data bytes are appended raw: escaping is applied later by
+    :func:`encode_packet`, so ``$``, ``#``, ``}`` and ``*`` keep their
+    original values at this layer.
+    """
+    if operation == FLASH_ERASE:
+        address = _uint(fields["address"], 32, "address")
+        length = _uint(fields["length"], 32, "length")
+        if not 1 <= length <= _ADDRESS_MAX:
+            raise RspError("invalid_field", f"length must be between 1 and {_ADDRESS_MAX}")
+        _no_overflow(address, length, "address + length")
+        command = f"vFlashErase:{address:x},{length:x}".encode("ascii")
+
+    elif operation == FLASH_WRITE:
+        address = _uint(fields["address"], 32, "address")
+        data = _hex_bytes(fields["data"], "data")
+        if len(data) == 0:
+            raise RspError("invalid_field", "data must not be empty")
+        _no_overflow(address, len(data), "address + data length")
+        command = f"vFlashWrite:{address:x}:".encode("ascii") + data
+        if len(command) > MAX_PAYLOAD:
+            raise RspError("invalid_field", f"command payload exceeds {MAX_PAYLOAD} bytes")
+
+    else:  # FLASH_DONE
+        command = b"vFlashDone"
 
     return {"payload": command.hex()}
 

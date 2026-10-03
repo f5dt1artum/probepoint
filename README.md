@@ -55,12 +55,17 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
   - `read_register`：字段 `{"operation", "register"}`，编码为 `p<register>`；`register` 为 u16。
   - `write_register`：字段 `{"operation", "register", "value"}`，编码为 `P<register>=<value>`；`value` 为 1 至 32 字节的偶数位十六进制。
   - `continue`：字段 `{"operation", "address"?}`，编码为 `c`（省略 `address`）或 `c<address>`；`single_step` 同理编码为 `s`/`s<address>`。`address` 为 u32，序列化为无前导零的小写十六进制（0 编码为 `0`）。
-  - 内存访问要求 `address` 加访问字节数不越过 `0xffffffff`（即字节范围必须完整落在 32 位地址空间内），越界返回 `invalid_field`。
+  - `flash_erase`：字段 `{"operation", "address", "length"}`，编码为 `vFlashErase:<address>,<length>`。`address` 为 u32 非布尔整数，`length` 为 1 至 `0xffffffff`；半开区间 `[address, address+length)` 必须完整落在 32 位地址空间内，越界返回 `invalid_field`。
+  - `flash_write`：字段 `{"operation", "address", "data"}`，编码为 ASCII `vFlashWrite:<address>:` 后直接拼接 `data` 解码出的原始字节（非十六进制文本）。`data` 为非空偶数位十六进制；写入范围不得越过 32 位地址空间，且完整命令载荷不得超过 4096 字节。`0x00`、`0x24`、`0x23`、`0x7d`、`0x2a` 等字节在此层保持原值，只有再交给 `/v1/rsp/encode` 时才转义。
+  - `flash_done`：字段仅 `{"operation"}`，编码为 `vFlashDone`。
+  - 三种 flash 操作均拒绝额外字段；内存访问要求 `address` 加访问字节数不越过 `0xffffffff`（即字节范围必须完整落在 32 位地址空间内），越界返回 `invalid_field`。
 - `POST /v1/rsp/commands/decode-response`：解释目标回复载荷，字段为 `{"operation", "payload", ...}`；`read_memory` 必须携带 `expected_length`（1 至 4096），`read_register` 必须携带 `expected_size`（1 至 32），写操作与 `continue`/`single_step` 不得携带这两个字段。内存/寄存器结果：
   - 空载荷返回 `{"status": "unsupported"}`。
   - `E` 加两位十六进制错误码返回 `{"status": "error", "code": "<小写两位码>"}`。
   - 读取成功返回 `{"status": "ok", "data": "<小写十六进制>"}`（内存）或 `{"status": "ok", "value": "<小写十六进制>"}`（寄存器），内容长度必须与期望值一致。
   - 写入成功只接受 ASCII `OK`，返回 `{"status": "ok"}`。
+
+`flash_erase`、`flash_write`、`flash_done` 的回复只接收 `{"operation", "payload"}`（拒绝其他任何字段），解释规则与写操作相同：空载荷返回 `{"status": "unsupported"}`；精确 ASCII `OK` 返回 `{"status": "ok"}`；`E` 加两位十六进制返回 `{"status": "error", "code": "<小写两位>"}`；非 ASCII、残缺或格式错误的 `E` 及其他回复返回 `invalid_response`。
 
 `continue` 与 `single_step` 的回复（一次请求只解释一个流入口取出的 payload）：
 
@@ -71,7 +76,7 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
   - `X` 加两位十六进制信号值返回 `{"status": "terminated", "signal": "<小写两位>"}`。
   - `O` 后跟偶数位十六进制数据返回 `{"status": "console", "data": "<小写十六进制>"}`，允许空数据。
 
-请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型或取值范围错误、十六进制格式错误、写操作或执行操作携带期望长度、`continue`/`single_step` 的 `address` 类型或范围错误返回 `invalid_field`（HTTP 400）；回复含非法字符、被截断、长度与期望不符，成功形式与 `operation` 不符（如读取收到 `OK`、写入收到数据），或执行回复出现未知前缀、`OK`、位数错误/含非十六进制内容的 `S`/`T`/`W`/`X`/`E`、奇数位或非十六进制的 `O` 数据、`T` 字段缺少冒号、键或值为空、含非 ASCII 内容，返回 `invalid_response`（HTTP 400）。
+请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型或取值范围错误、十六进制格式错误、空 `data`、`flash_erase`/`flash_write` 地址区间越界、`flash_write` 完整命令载荷超过 4096 字节、写操作或执行操作携带期望长度、flash 回复携带 `operation`/`payload` 以外字段、`continue`/`single_step` 的 `address` 类型或范围错误返回 `invalid_field`（HTTP 400）；回复含非法字符、被截断、长度与期望不符，成功形式与 `operation` 不符（如读取收到 `OK`、写入收到数据），或执行回复出现未知前缀、`OK`、位数错误/含非十六进制内容的 `S`/`T`/`W`/`X`/`E`、奇数位或非十六进制的 `O` 数据、`T` 字段缺少冒号、键或值为空、含非 ASCII 内容，返回 `invalid_response`（HTTP 400）。
 
 ## 离线栈回溯（ARM Cortex-M）
 
