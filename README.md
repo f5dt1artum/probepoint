@@ -73,6 +73,16 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型或范围错误、非法十六进制、栈地址溢出、非法或重叠符号区间返回 `invalid_field`（HTTP 400）。结构合法但无法继续展开时只按上述 `stop_reason` 返回部分结果（HTTP 200）。
 
+## ELF 符号解析（ARM 固件）
+
+`POST /v1/symbols/resolve` 无状态地把一组地址解析为函数符号：调用方在请求中提交完整的 ARM 固件 ELF 与地址列表，服务端不保存 ELF 或结果，也不修改断点状态。请求体为 `{"elf": "<偶数位十六进制，解码后不超过 4194304 字节>", "addresses": [u32, ...], "include_local": bool}`；`addresses` 含 1 至 256 项，按输入顺序处理并保留重复值。
+
+入口只接受 ELF32、小端、`EM_ARM` 文件，解析节头表、`SHT_SYMTAB`、`SHT_DYNSYM` 及其字符串表。候选符号只取已定义、名称非空且大小非零的 `STT_FUNC`；`include_local=false` 时排除 `STB_LOCAL`。查询地址与符号起点均清除最低 Thumb 位，命中条件为 `start <= address < start + size`。多个符号同时命中时依次选择：起点最大者、绑定优先级 `STB_GLOBAL` > `STB_WEAK` > `STB_LOCAL`、范围更小者、符号表节序号更小者、表内序号更小者。
+
+成功返回 HTTP 200 与 `{"results": [...]}`，每项保留原始 `address`；命中项还含 `name`、`symbol_address`、`offset`、`size`、`binding`（`global`/`weak`/`local`），未命中时这五项均为 JSON `null`。
+
+请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型错误、非法十六进制、ELF 大小或地址数量越界返回 `invalid_field`（HTTP 400）；损坏或截断的 ELF、越界的节或字符串引用、候选名称不是有效 UTF-8、符号范围溢出返回 `invalid_elf`（HTTP 400）；类别、字节序或机器类型不支持返回 `unsupported_elf`（HTTP 422）；两类符号表都不存在返回 `symbol_table_not_found`（HTTP 422）。
+
 ## 断点与观察点（v1）
 
 记录仅保存在当前服务进程中，重启后为空，不产生任何持久化副作用。id 为按创建顺序递增的正整数，同一进程内不复用；返回对象包含全部规范化字段（execute 无 `size`，其他类型带 `size`）。
