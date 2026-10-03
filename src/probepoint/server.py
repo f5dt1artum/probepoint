@@ -14,12 +14,30 @@ from .frames import FrameError
 from .itm import ItmError
 from .rsp import RspError
 from .service import Service
+from .sessions import SessionError, parse_session_id
 from .symbols import SymbolResolveError
 
 BREAKPOINTS_PATH = "/v1/breakpoints"
 BREAKPOINTS_PREFIX = BREAKPOINTS_PATH + "/"
+SESSIONS_PATH = "/v1/sessions"
+SESSIONS_PREFIX = SESSIONS_PATH + "/"
+SESSION_BREAKPOINTS = "breakpoints"
 
 _BAD_REQUEST = object()  # sentinel: invalid_request response already sent
+
+
+def session_route(path: str) -> tuple[str, str | None] | None:
+    """Split a ``/v1/sessions/...`` path into (raw session id, subpath).
+
+    ``subpath`` is ``None`` for the session item itself, ``"breakpoints"``
+    for the nested collection and ``"breakpoints/<rest>"`` for anything
+    below it. Returns ``None`` when there is no usable id segment.
+    """
+    tail = path[len(SESSIONS_PREFIX) :]
+    raw_id, sep, rest = tail.partition("/")
+    if not raw_id:
+        return None
+    return raw_id, (rest if sep else None)
 
 
 def env_address() -> tuple[str, int]:
@@ -44,6 +62,22 @@ class Handler(BaseHTTPRequestHandler):
     def send_error_json(self, status: int, code: str, message: str) -> None:
         self.send_json(status, {"error": {"code": code, "message": message}})
 
+    def read_raw_body(self) -> bytes:
+        """Consume the request body so responses never reset the connection."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        return self.rfile.read(length) if length > 0 else b""
+
+    def parse_json_body(self, raw: bytes) -> object:
+        """Parse an already-read body, sending ``invalid_request`` on failure."""
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_error_json(400, "invalid_request", "request body is not valid JSON")
+            return _BAD_REQUEST
+
     def read_json_body(self) -> object:
         """Return the parsed JSON body.
 
@@ -51,16 +85,7 @@ class Handler(BaseHTTPRequestHandler):
         body is not parseable JSON; a body that parses to ``null`` is still
         returned as ``None`` so the handler can apply its object check.
         """
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        raw = self.rfile.read(length) if length > 0 else b""
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self.send_error_json(400, "invalid_request", "request body is not valid JSON")
-            return _BAD_REQUEST
+        return self.parse_json_body(self.read_raw_body())
 
     def do_GET(self) -> None:
         parts = urlsplit(self.path)
@@ -75,6 +100,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, result)
             return
+        if parts.path == SESSIONS_PATH:
+            self.send_json(200, self.service.list_sessions())
+            return
+        if parts.path.startswith(SESSIONS_PREFIX):
+            route = session_route(parts.path)
+            if route is not None and route[1] == SESSION_BREAKPOINTS:
+                try:
+                    session_id = parse_session_id(route[0])
+                    self.service.require_session(session_id)
+                    result = self.service.list_session_breakpoints(session_id, parts.query)
+                except (SessionError, BreakpointError) as exc:
+                    self.send_error_json(exc.status, exc.code, exc.message)
+                    return
+                self.send_json(200, result)
+                return
         self.send_error_json(404, "not_found", f"no route for {self.path}")
 
     def do_POST(self) -> None:
@@ -89,6 +129,42 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(201, result)
             return
+
+        if self.path == SESSIONS_PATH:
+            body = self.read_json_body()
+            if body is _BAD_REQUEST:
+                return
+            try:
+                result = self.service.create_session(body)
+            except SessionError as exc:
+                self.send_error_json(exc.status, exc.code, exc.message)
+                return
+            self.send_json(201, result)
+            return
+
+        parts = urlsplit(self.path)
+        if parts.path.startswith(SESSIONS_PREFIX):
+            route = session_route(parts.path)
+            if route is not None and route[1] == SESSION_BREAKPOINTS:
+                # Consume the body before validating so a racing session
+                # delete still gets a clean 404 response on the wire.
+                raw = self.read_raw_body()
+                try:
+                    session_id = parse_session_id(route[0])
+                    self.service.require_session(session_id)
+                except SessionError as exc:
+                    self.send_error_json(exc.status, exc.code, exc.message)
+                    return
+                body = self.parse_json_body(raw)
+                if body is _BAD_REQUEST:
+                    return
+                try:
+                    result = self.service.create_session_breakpoint(session_id, body)
+                except (SessionError, BreakpointError) as exc:
+                    self.send_error_json(exc.status, exc.code, exc.message)
+                    return
+                self.send_json(201, result)
+                return
 
         routes = {
             "/v1/frames/encode": self.service.encode_frame,
@@ -121,6 +197,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         parts = urlsplit(self.path)
+        if parts.path.startswith(SESSIONS_PREFIX):
+            route = session_route(parts.path)
+            if route is not None and route[1] is not None:
+                raw_id = self._nested_breakpoint_id(route[1])
+                if raw_id is not None:
+                    self._handle_session_breakpoint_patch(route[0], raw_id)
+                    return
         if not parts.path.startswith(BREAKPOINTS_PREFIX):
             self.send_error_json(404, "not_found", f"no route for {self.path}")
             return
@@ -128,12 +211,15 @@ class Handler(BaseHTTPRequestHandler):
         if not raw_id:
             self.send_error_json(404, "not_found", f"no route for {self.path}")
             return
+        # Consume the body before validating so error responses are never
+        # cut short by unread request data resetting the connection.
+        raw = self.read_raw_body()
         try:
             record_id = parse_breakpoint_id(raw_id)
         except BreakpointError as exc:
             self.send_error_json(exc.status, exc.code, exc.message)
             return
-        body = self.read_json_body()
+        body = self.parse_json_body(raw)
         if body is _BAD_REQUEST:
             return
         try:
@@ -143,8 +229,47 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(200, result)
 
+    def _nested_breakpoint_id(self, subpath: str) -> str | None:
+        """Return the raw breakpoint id below ``breakpoints/``, else None."""
+        prefix = SESSION_BREAKPOINTS + "/"
+        if not subpath.startswith(prefix):
+            return None
+        raw_id = subpath[len(prefix) :]
+        return raw_id or None
+
+    def _handle_session_breakpoint_patch(self, raw_session_id: str, raw_id: str) -> None:
+        # Consume the body before validating so a racing session delete
+        # still gets a clean 404 response on the wire.
+        raw = self.read_raw_body()
+        try:
+            session_id = parse_session_id(raw_session_id)
+            self.service.require_session(session_id)
+            record_id = parse_breakpoint_id(raw_id)
+        except (SessionError, BreakpointError) as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+            return
+        body = self.parse_json_body(raw)
+        if body is _BAD_REQUEST:
+            return
+        try:
+            result = self.service.update_session_breakpoint(session_id, record_id, body)
+        except (SessionError, BreakpointError) as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+            return
+        self.send_json(200, result)
+
     def do_DELETE(self) -> None:
         parts = urlsplit(self.path)
+        if parts.path.startswith(SESSIONS_PREFIX):
+            route = session_route(parts.path)
+            if route is not None:
+                if route[1] is None:
+                    self._handle_session_delete(route[0])
+                    return
+                raw_id = self._nested_breakpoint_id(route[1])
+                if raw_id is not None:
+                    self._handle_session_breakpoint_delete(route[0], raw_id)
+                    return
         if not parts.path.startswith(BREAKPOINTS_PREFIX):
             self.send_error_json(404, "not_found", f"no route for {self.path}")
             return
@@ -160,6 +285,26 @@ class Handler(BaseHTTPRequestHandler):
         try:
             result = self.service.delete_breakpoint(record_id)
         except BreakpointError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+            return
+        self.send_json(200, result)
+
+    def _handle_session_delete(self, raw_session_id: str) -> None:
+        try:
+            session_id = parse_session_id(raw_session_id)
+            result = self.service.delete_session(session_id)
+        except SessionError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+            return
+        self.send_json(200, result)
+
+    def _handle_session_breakpoint_delete(self, raw_session_id: str, raw_id: str) -> None:
+        try:
+            session_id = parse_session_id(raw_session_id)
+            self.service.require_session(session_id)
+            record_id = parse_breakpoint_id(raw_id)
+            result = self.service.delete_session_breakpoint(session_id, record_id)
+        except (SessionError, BreakpointError) as exc:
             self.send_error_json(exc.status, exc.code, exc.message)
             return
         self.send_json(200, result)

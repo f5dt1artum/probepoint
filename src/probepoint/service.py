@@ -2,8 +2,9 @@
 
 The frozen baseline reports process health and exposes the v1 frame codec.
 Breakpoint/watchpoint management lives in :mod:`probepoint.breakpoints`;
-records are process-local and never persisted. Keep the public surface here
-backward compatible.
+multi-target sessions live in :mod:`probepoint.sessions`. Records are
+process-local and never persisted. Keep the public surface here backward
+compatible.
 """
 
 from __future__ import annotations
@@ -22,17 +23,20 @@ from .rsp import decode_command_response
 from .rsp import decode_stream as rsp_decode_stream
 from .rsp import encode_command
 from .rsp import encode_packet
+from .sessions import SessionStore
+from .sessions import parse_create as parse_session_create
 from .symbols import resolve_symbols
 
 
 class Service:
-    """Health reporting, frame/RSP codecs and in-process breakpoints."""
+    """Health reporting, frame/RSP codecs, breakpoints and sessions."""
 
     name = "probepoint"
     version = __version__
 
     def __init__(self) -> None:
         self.breakpoints = BreakpointStore()
+        self.sessions = SessionStore()
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -80,3 +84,31 @@ class Service:
 
     def delete_breakpoint(self, record_id: int) -> dict[str, int]:
         return self.breakpoints.delete(record_id)
+
+    def create_session(self, body: object) -> dict[str, object]:
+        return self.sessions.create(parse_session_create(body))
+
+    def list_sessions(self) -> list[dict[str, object]]:
+        return self.sessions.list()
+
+    def delete_session(self, session_id: int) -> dict[str, int]:
+        return self.sessions.delete(session_id)
+
+    def require_session(self, session_id: int) -> None:
+        self.sessions.require(session_id)
+
+    def create_session_breakpoint(self, session_id: int, body: object) -> dict[str, object]:
+        kind, address, size, enabled = parse_create(body)
+        return self.sessions.create_breakpoint(session_id, kind, address, size, enabled)
+
+    def list_session_breakpoints(self, session_id: int, query: str) -> list[dict[str, object]]:
+        kind, enabled = parse_list_query(query)
+        return self.sessions.list_breakpoints(session_id, kind, enabled)
+
+    def update_session_breakpoint(
+        self, session_id: int, record_id: int, body: object
+    ) -> dict[str, object]:
+        return self.sessions.update_breakpoint(session_id, record_id, parse_patch(body))
+
+    def delete_session_breakpoint(self, session_id: int, record_id: int) -> dict[str, int]:
+        return self.sessions.delete_breakpoint(session_id, record_id)
