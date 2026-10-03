@@ -23,10 +23,16 @@ READ_REGISTER = "read_register"
 WRITE_REGISTER = "write_register"
 CONTINUE = "continue"
 SINGLE_STEP = "single_step"
+FLASH_ERASE = "flash_erase"
+FLASH_WRITE = "flash_write"
+FLASH_DONE = "flash_done"
 _READ_OPERATIONS = frozenset({READ_MEMORY, READ_REGISTER})
 _WRITE_OPERATIONS = frozenset({WRITE_MEMORY, WRITE_REGISTER})
 _EXECUTION_OPERATIONS = frozenset({CONTINUE, SINGLE_STEP})
-_COMMAND_OPERATIONS = _READ_OPERATIONS | _WRITE_OPERATIONS | _EXECUTION_OPERATIONS
+_FLASH_OPERATIONS = frozenset({FLASH_ERASE, FLASH_WRITE, FLASH_DONE})
+_COMMAND_OPERATIONS = (
+    _READ_OPERATIONS | _WRITE_OPERATIONS | _EXECUTION_OPERATIONS | _FLASH_OPERATIONS
+)
 
 DOLLAR = 0x24  # '$' packet start
 HASH = 0x23  # '#' payload/checksum separator
@@ -218,6 +224,9 @@ _ENCODE_FIELDS = {
     WRITE_REGISTER: frozenset({"operation", "register", "value"}),
     CONTINUE: frozenset({"operation"}),
     SINGLE_STEP: frozenset({"operation"}),
+    FLASH_ERASE: frozenset({"operation", "address", "length"}),
+    FLASH_WRITE: frozenset({"operation", "address", "data"}),
+    FLASH_DONE: frozenset({"operation"}),
 }
 _ENCODE_OPTIONAL = {
     CONTINUE: frozenset({"address"}),
@@ -230,13 +239,24 @@ _RESPONSE_FIELDS = {
     WRITE_REGISTER: frozenset({"operation", "payload"}),
     CONTINUE: frozenset({"operation", "payload"}),
     SINGLE_STEP: frozenset({"operation", "payload"}),
+    FLASH_ERASE: frozenset({"operation", "payload"}),
+    FLASH_WRITE: frozenset({"operation", "payload"}),
+    FLASH_DONE: frozenset({"operation", "payload"}),
 }
 _ADDRESS_MAX = 0xFFFFFFFF
+_ADDRESS_SPACE = 1 << 32
 
 
 def _no_overflow(address: int, count: int, field: str) -> None:
     # address + accessed bytes must not cross 0xffffffff (u32 overflow).
     if address + count > _ADDRESS_MAX:
+        raise RspError("invalid_field", f"{field} crosses the end of the 32-bit address space")
+
+
+def _no_range_overflow(address: int, count: int, field: str) -> None:
+    # The half-open range [address, address + count) must lie within the
+    # 32-bit address space, i.e. address + count must not exceed 2**32.
+    if address + count > _ADDRESS_SPACE:
         raise RspError("invalid_field", f"{field} crosses the end of the 32-bit address space")
 
 
@@ -270,8 +290,11 @@ def encode_command(body: object) -> dict[str, str]:
 
     The returned ``{"payload": <lowercase hex>}`` feeds directly into
     :func:`encode_packet`.  The encoded command is ``m``/``M`` for memory,
-    ``p``/``P`` for registers and ``c``/``s`` for continue/step; numbers are
-    bare lowercase hex and write data keeps its byte order.
+    ``p``/``P`` for registers, ``c``/``s`` for continue/step and the
+    ``vFlashErase``/``vFlashWrite``/``vFlashDone`` forms for flashing;
+    numbers are bare lowercase hex and write data keeps its byte order.
+    ``vFlashWrite`` carries the raw data bytes unescaped — byte values such
+    as 0x24, 0x23, 0x7d and 0x2a are only escaped by :func:`encode_packet`.
     """
     operation, fields = _operation_fields(body, _ENCODE_FIELDS, _ENCODE_OPTIONAL)
 
@@ -303,6 +326,27 @@ def encode_command(body: object) -> dict[str, str]:
         if not 1 <= len(value) <= MAX_REGISTER:
             raise RspError("invalid_field", f"value must be between 1 and {MAX_REGISTER} bytes")
         command = f"P{register:x}=".encode("ascii") + value_text.lower().encode("ascii")
+
+    elif operation == FLASH_ERASE:
+        address = _uint(fields["address"], 32, "address")
+        length = _uint(fields["length"], 32, "length")
+        if not 1 <= length <= _ADDRESS_MAX:
+            raise RspError("invalid_field", f"length must be between 1 and {_ADDRESS_MAX:#x}")
+        _no_range_overflow(address, length, "address + length")
+        command = f"vFlashErase:{address:x},{length:x}".encode("ascii")
+
+    elif operation == FLASH_WRITE:
+        address = _uint(fields["address"], 32, "address")
+        data = _hex_bytes(fields["data"], "data")
+        if len(data) < 1:
+            raise RspError("invalid_field", "data must not be empty")
+        _no_range_overflow(address, len(data), "address + data length")
+        command = f"vFlashWrite:{address:x}:".encode("ascii") + data
+        if len(command) > MAX_PAYLOAD:
+            raise RspError("invalid_field", f"payload exceeds {MAX_PAYLOAD} bytes")
+
+    elif operation == FLASH_DONE:
+        command = b"vFlashDone"
 
     else:  # CONTINUE / SINGLE_STEP
         letter = b"c" if operation == CONTINUE else b"s"
@@ -374,9 +418,10 @@ def decode_command_response(body: object) -> dict[str, object]:
     Returns ``{"status": "unsupported"}`` for an empty payload,
     ``{"status": "error", "code": <two lowercase hex>}`` for an ``E`` reply,
     ``{"status": "ok", "data"|"value": <lowercase hex>}`` for a read and
-    ``{"status": "ok"}`` for a write's ``OK``.  Continue/step replies decode
-    the stop (``S``/``T``), exit (``W``), termination (``X``) and console
-    (``O``) forms.  Anything else is an ``invalid_response`` error.
+    ``{"status": "ok"}`` for a write's or flash command's ``OK``.  Continue/
+    step replies decode the stop (``S``/``T``), exit (``W``), termination
+    (``X``) and console (``O``) forms.  Anything else is an
+    ``invalid_response`` error.
     """
     operation, fields = _operation_fields(body, _RESPONSE_FIELDS)
     is_read = operation in _READ_OPERATIONS
@@ -415,7 +460,7 @@ def decode_command_response(body: object) -> dict[str, object]:
         return _decode_execution_reply(text)
 
     if not is_read:
-        raise RspError("invalid_response", "write response must be OK, empty or an E error")
+        raise RspError("invalid_response", "write/flash response must be OK, empty or an E error")
 
     if len(text) % 2 != 0 or any(c not in _HEXDIGITS for c in text):
         raise RspError("invalid_response", "read response must be even-length hex data")
