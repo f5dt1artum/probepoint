@@ -14,6 +14,9 @@ READ_MEMORY = "read_memory"
 WRITE_MEMORY = "write_memory"
 READ_REGISTER = "read_register"
 WRITE_REGISTER = "write_register"
+CONTINUE = "continue"
+SINGLE_STEP = "single_step"
+EXECUTION_OPERATIONS = (CONTINUE, SINGLE_STEP)
 
 
 def ascii_hex(text: str) -> str:
@@ -213,6 +216,45 @@ class EncodeCommandTest(RspCommandsHttpTest):
         )
 
 
+class ExecutionEncodeTest(RspCommandsHttpTest):
+    def test_without_address(self) -> None:
+        status, body = self.encode({"operation": CONTINUE})
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"payload": ascii_hex("c")})
+        status, body = self.encode({"operation": SINGLE_STEP})
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"payload": ascii_hex("s")})
+
+    def test_with_address(self) -> None:
+        cases = [
+            (CONTINUE, 0, b"c0"),
+            (CONTINUE, 0x1A, b"c1a"),
+            (SINGLE_STEP, 0, b"s0"),
+            (SINGLE_STEP, 0xFFFFFFFF, b"sffffffff"),
+        ]
+        for operation, address, expected in cases:
+            with self.subTest(operation=operation, address=address):
+                status, body = self.encode({"operation": operation, "address": address})
+                self.assertEqual(status, 200)
+                self.assertEqual(bytes.fromhex(body["payload"]), expected)
+
+    def test_bad_address_and_fields(self) -> None:
+        cases = [
+            {"operation": CONTINUE, "address": -1},
+            {"operation": SINGLE_STEP, "address": 1 << 32},
+            {"operation": CONTINUE, "address": "10"},
+            {"operation": SINGLE_STEP, "address": True},
+            {"operation": CONTINUE, "address": 0, "extra": 1},
+            {"operation": CONTINUE, "expected_length": 1},
+            {"operation": SINGLE_STEP, "expected_size": 1},
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                status, resp = self.encode(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_field")
+
+
 class DecodeCommandResponseTest(RspCommandsHttpTest):
     def test_empty_payload_is_unsupported(self) -> None:
         for body in (
@@ -362,6 +404,102 @@ class DecodeCommandResponseTest(RspCommandsHttpTest):
                 status, resp = self.post(RESPONSE_PATH, raw)
                 self.assertEqual(status, 400)
                 self.assertEqual(resp["error"]["code"], "invalid_request")
+
+
+class ExecutionDecodeTest(RspCommandsHttpTest):
+    def resp(self, operation: str, text: str) -> tuple[int, dict]:
+        return self.respond({"operation": operation, "payload": ascii_hex(text)})
+
+    def test_empty_and_error(self) -> None:
+        for operation in EXECUTION_OPERATIONS:
+            with self.subTest(operation=operation):
+                status, body = self.resp(operation, "")
+                self.assertEqual((status, body), (200, {"status": "unsupported"}))
+                status, body = self.resp(operation, "EAF")
+                self.assertEqual((status, body), (200, {"status": "error", "code": "af"}))
+
+    def test_s_stop(self) -> None:
+        for operation in EXECUTION_OPERATIONS:
+            with self.subTest(operation=operation):
+                status, body = self.resp(operation, "S05")
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    body,
+                    {"status": "stopped", "signal": "05", "details": []},
+                )
+                # Signal digits are normalized to lowercase.
+                status, body = self.resp(operation, "SAB")
+                self.assertEqual(body["signal"], "ab")
+
+    def test_t_stop_fields_in_order_with_duplicates(self) -> None:
+        for operation in EXECUTION_OPERATIONS:
+            with self.subTest(operation=operation):
+                status, body = self.resp(operation, "T0505:1;thread:02;06:0000;")
+                self.assertEqual(status, 200)
+                self.assertEqual(body["status"], "stopped")
+                self.assertEqual(body["signal"], "05")
+                self.assertEqual(
+                    body["details"],
+                    [
+                        {"key": "05", "value": "1"},
+                        {"key": "thread", "value": "02"},
+                        {"key": "06", "value": "0000"},
+                    ],
+                )
+                # Duplicate keys keep order and multiplicity; no trailing ';'.
+                status, body = self.resp(operation, "T0aa:1;a:2")
+                self.assertEqual(
+                    body["details"],
+                    [{"key": "a", "value": "1"}, {"key": "a", "value": "2"}],
+                )
+
+    def test_w_and_x(self) -> None:
+        for operation in EXECUTION_OPERATIONS:
+            status, body = self.resp(operation, "W00")
+            self.assertEqual((status, body), (200, {"status": "exited", "code": "00"}))
+            status, body = self.resp(operation, "X0B")
+            self.assertEqual((status, body), (200, {"status": "terminated", "signal": "0b"}))
+
+    def test_console_output(self) -> None:
+        for operation in EXECUTION_OPERATIONS:
+            status, body = self.resp(operation, "O")
+            self.assertEqual((status, body), (200, {"status": "console", "data": ""}))
+            status, body = self.resp(operation, "O4845")
+            self.assertEqual((status, body), (200, {"status": "console", "data": "4845"}))
+            status, body = self.resp(operation, "OABCD")
+            self.assertEqual(body["data"], "abcd")
+
+    def test_expected_fields_rejected(self) -> None:
+        for field in ("expected_length", "expected_size"):
+            body = {"operation": CONTINUE, "payload": "", field: 1}
+            status, resp = self.respond(body)
+            self.assertEqual(status, 400)
+            self.assertEqual(resp["error"]["code"], "invalid_field")
+
+    def test_invalid_responses(self) -> None:
+        cases = [
+            "OK", "Q", "q",
+            "S5", "Szz", "S012",
+            "T5", "Tzz", "T05nocolon", "T05:1", "T05a:",
+            "T05a:1;;b:2",  # empty field between semicolons
+            "W1", "Wzz",
+            "X1", "Xzz",
+            "E1", "Ezz",
+            "Oabc", "Ozz",
+        ]
+        for operation in EXECUTION_OPERATIONS:
+            for text in cases:
+                with self.subTest(operation=operation, text=text):
+                    status, resp = self.resp(operation, text)
+                    self.assertEqual(status, 400)
+                    self.assertEqual(resp["error"]["code"], "invalid_response")
+
+    def test_non_ascii_payload(self) -> None:
+        for operation in EXECUTION_OPERATIONS:
+            body = {"operation": operation, "payload": "80"}
+            status, resp = self.respond(body)
+            self.assertEqual(status, 400)
+            self.assertEqual(resp["error"]["code"], "invalid_response")
 
 
 if __name__ == "__main__":
