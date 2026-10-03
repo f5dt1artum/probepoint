@@ -21,6 +21,7 @@ from .rsp import decode_command_response
 from .rsp import decode_stream as rsp_decode_stream
 from .rsp import encode_command
 from .rsp import encode_packet
+from .symbols import resolve_symbols
 
 
 class Service:
@@ -58,6 +59,9 @@ class Service:
 
     def backtrace(self, body: object) -> dict[str, object]:
         return backtrace(body)
+
+    def resolve_symbols(self, body: object) -> dict[str, object]:
+        return resolve_symbols(body)
 
     def create_breakpoint(self, body: object) -> dict[str, object]:
         kind, address, size, enabled = parse_create(body)

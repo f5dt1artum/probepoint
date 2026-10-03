@@ -13,6 +13,7 @@ from .breakpoints import BreakpointError, parse_breakpoint_id
 from .frames import FrameError
 from .rsp import RspError
 from .service import Service
+from .symbols import SymbolResolveError
 
 BREAKPOINTS_PATH = "/v1/breakpoints"
 BREAKPOINTS_PREFIX = BREAKPOINTS_PATH + "/"
@@ -97,6 +98,7 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/rsp/commands/encode": self.service.encode_rsp_command,
             "/v1/rsp/commands/decode-response": self.service.decode_rsp_command_response,
             "/v1/backtrace": self.service.backtrace,
+            "/v1/symbols/resolve": self.service.resolve_symbols,
         }
         handler = routes.get(self.path)
         if handler is None:
@@ -107,6 +109,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             result = handler(body)
+        except SymbolResolveError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+            return
         except (FrameError, RspError, BacktraceError) as exc:
             self.send_error_json(400, exc.code, exc.message)
             return
