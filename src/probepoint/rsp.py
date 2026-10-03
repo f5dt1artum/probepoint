@@ -21,9 +21,12 @@ READ_MEMORY = "read_memory"
 WRITE_MEMORY = "write_memory"
 READ_REGISTER = "read_register"
 WRITE_REGISTER = "write_register"
+CONTINUE = "continue"
+SINGLE_STEP = "single_step"
 _READ_OPERATIONS = frozenset({READ_MEMORY, READ_REGISTER})
 _WRITE_OPERATIONS = frozenset({WRITE_MEMORY, WRITE_REGISTER})
-_COMMAND_OPERATIONS = _READ_OPERATIONS | _WRITE_OPERATIONS
+_EXECUTION_OPERATIONS = frozenset({CONTINUE, SINGLE_STEP})
+_COMMAND_OPERATIONS = _READ_OPERATIONS | _WRITE_OPERATIONS | _EXECUTION_OPERATIONS
 
 DOLLAR = 0x24  # '$' packet start
 HASH = 0x23  # '#' payload/checksum separator
@@ -213,12 +216,20 @@ _ENCODE_FIELDS = {
     WRITE_MEMORY: frozenset({"operation", "address", "data"}),
     READ_REGISTER: frozenset({"operation", "register"}),
     WRITE_REGISTER: frozenset({"operation", "register", "value"}),
+    CONTINUE: frozenset({"operation"}),
+    SINGLE_STEP: frozenset({"operation"}),
+}
+_ENCODE_OPTIONAL = {
+    CONTINUE: frozenset({"address"}),
+    SINGLE_STEP: frozenset({"address"}),
 }
 _RESPONSE_FIELDS = {
     READ_MEMORY: frozenset({"operation", "payload", "expected_length"}),
     READ_REGISTER: frozenset({"operation", "payload", "expected_size"}),
     WRITE_MEMORY: frozenset({"operation", "payload"}),
     WRITE_REGISTER: frozenset({"operation", "payload"}),
+    CONTINUE: frozenset({"operation", "payload"}),
+    SINGLE_STEP: frozenset({"operation", "payload"}),
 }
 _ADDRESS_MAX = 0xFFFFFFFF
 
@@ -229,7 +240,11 @@ def _no_overflow(address: int, count: int, field: str) -> None:
         raise RspError("invalid_field", f"{field} crosses the end of the 32-bit address space")
 
 
-def _operation_fields(body: object, allowed_by_operation: dict[str, frozenset[str]]) -> tuple[str, dict]:
+def _operation_fields(
+    body: object,
+    allowed_by_operation: dict[str, frozenset[str]],
+    optional_by_operation: dict[str, frozenset[str]] | None = None,
+) -> tuple[str, dict]:
     if not isinstance(body, dict):
         raise RspError("invalid_request", "request body must be a JSON object")
     if "operation" not in body:
@@ -240,10 +255,11 @@ def _operation_fields(body: object, allowed_by_operation: dict[str, frozenset[st
             "invalid_field", "operation must be one of: " + ", ".join(sorted(_COMMAND_OPERATIONS))
         )
     allowed = allowed_by_operation[operation]
+    optional = (optional_by_operation or {}).get(operation, frozenset())
     missing = allowed - body.keys()
     if missing:
         raise RspError("invalid_field", f"missing field(s): {', '.join(sorted(missing))}")
-    extra = body.keys() - allowed
+    extra = body.keys() - allowed - optional
     if extra:
         raise RspError("invalid_field", f"unexpected field(s): {', '.join(sorted(extra))}")
     return operation, body
@@ -253,11 +269,11 @@ def encode_command(body: object) -> dict[str, str]:
     """Validate a command request and return its ASCII RSP payload as hex.
 
     The returned ``{"payload": <lowercase hex>}`` feeds directly into
-    :func:`encode_packet`.  The encoded command is ``m``/``M`` for memory and
-    ``p``/``P`` for registers; numbers are bare lowercase hex and write data
-    keeps its byte order.
+    :func:`encode_packet`.  The encoded command is ``m``/``M`` for memory,
+    ``p``/``P`` for registers and ``c``/``s`` for continue/step; numbers are
+    bare lowercase hex and write data keeps its byte order.
     """
-    operation, fields = _operation_fields(body, _ENCODE_FIELDS)
+    operation, fields = _operation_fields(body, _ENCODE_FIELDS, _ENCODE_OPTIONAL)
 
     if operation == READ_MEMORY:
         address = _uint(fields["address"], 32, "address")
@@ -280,7 +296,7 @@ def encode_command(body: object) -> dict[str, str]:
         register = _uint(fields["register"], 16, "register")
         command = f"p{register:x}".encode("ascii")
 
-    else:  # WRITE_REGISTER
+    elif operation == WRITE_REGISTER:
         register = _uint(fields["register"], 16, "register")
         value_text = fields["value"]
         value = _hex_bytes(value_text, "value")
@@ -288,7 +304,68 @@ def encode_command(body: object) -> dict[str, str]:
             raise RspError("invalid_field", f"value must be between 1 and {MAX_REGISTER} bytes")
         command = f"P{register:x}=".encode("ascii") + value_text.lower().encode("ascii")
 
+    else:  # CONTINUE / SINGLE_STEP
+        letter = b"c" if operation == CONTINUE else b"s"
+        if "address" in fields:
+            address = _uint(fields["address"], 32, "address")
+            command = letter + f"{address:x}".encode("ascii")
+        else:
+            command = letter
+
     return {"payload": command.hex()}
+
+
+def _two_hex(text: str) -> bool:
+    return len(text) == 2 and all(c in "0123456789abcdefABCDEF" for c in text)
+
+
+def _decode_execution_reply(text: str) -> dict[str, object]:
+    """Interpret a continue/step reply per the stop-reply RSP forms."""
+    prefix, rest = text[0], text[1:]
+
+    if prefix == "S":
+        if not _two_hex(rest):
+            raise RspError("invalid_response", "stop response must be S followed by two hex digits")
+        return {"status": "stopped", "signal": rest.lower(), "details": []}
+
+    if prefix == "T":
+        if not (len(rest) >= 2 and all(c in _HEXDIGITS for c in rest[:2])):
+            raise RspError("invalid_response", "stop response must be T followed by two hex digits")
+        tail = rest[2:]
+        details: list[dict[str, str]] = []
+        if tail:
+            fields = tail.split(";")
+            # A trailing semicolon is allowed; any other empty segment means
+            # a field is missing or malformed.
+            if fields[-1] == "":
+                fields.pop()
+            for field in fields:
+                key, sep, value = field.partition(":")
+                if not sep or not key or not value:
+                    raise RspError(
+                        "invalid_response", "T fields must be non-empty ASCII key:value pairs"
+                    )
+                details.append({"key": key, "value": value})
+        return {"status": "stopped", "signal": rest[:2].lower(), "details": details}
+
+    if prefix == "W":
+        if not _two_hex(rest):
+            raise RspError("invalid_response", "exit response must be W followed by two hex digits")
+        return {"status": "exited", "code": rest.lower()}
+
+    if prefix == "X":
+        if not _two_hex(rest):
+            raise RspError(
+                "invalid_response", "termination response must be X followed by two hex digits"
+            )
+        return {"status": "terminated", "signal": rest.lower()}
+
+    if prefix == "O":
+        if len(rest) % 2 != 0 or any(c not in _HEXDIGITS for c in rest):
+            raise RspError("invalid_response", "console response must be O followed by even-length hex")
+        return {"status": "console", "data": rest.lower()}
+
+    raise RspError("invalid_response", f"unknown execution response prefix: {prefix}")
 
 
 def decode_command_response(body: object) -> dict[str, object]:
@@ -297,11 +374,13 @@ def decode_command_response(body: object) -> dict[str, object]:
     Returns ``{"status": "unsupported"}`` for an empty payload,
     ``{"status": "error", "code": <two lowercase hex>}`` for an ``E`` reply,
     ``{"status": "ok", "data"|"value": <lowercase hex>}`` for a read and
-    ``{"status": "ok"}`` for a write's ``OK``.  Anything else is an
-    ``invalid_response`` error.
+    ``{"status": "ok"}`` for a write's ``OK``.  Continue/step replies decode
+    the stop (``S``/``T``), exit (``W``), termination (``X``) and console
+    (``O``) forms.  Anything else is an ``invalid_response`` error.
     """
     operation, fields = _operation_fields(body, _RESPONSE_FIELDS)
     is_read = operation in _READ_OPERATIONS
+    is_execution = operation in _EXECUTION_OPERATIONS
 
     if is_read:
         expect_field = "expected_length" if operation == READ_MEMORY else "expected_size"
@@ -323,12 +402,17 @@ def decode_command_response(body: object) -> dict[str, object]:
     if text == "OK":
         if is_read:
             raise RspError("invalid_response", "OK is not a valid read response")
+        if is_execution:
+            raise RspError("invalid_response", "OK is not a valid execution response")
         return {"status": "ok"}
 
     if text[0] == "E":
         if len(text) != 3 or any(c not in "0123456789abcdefABCDEF" for c in text[1:]):
             raise RspError("invalid_response", "error response must be E followed by two hex digits")
         return {"status": "error", "code": text[1:].lower()}
+
+    if is_execution:
+        return _decode_execution_reply(text)
 
     if not is_read:
         raise RspError("invalid_response", "write response must be OK, empty or an E error")

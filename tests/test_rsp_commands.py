@@ -14,6 +14,8 @@ READ_MEMORY = "read_memory"
 WRITE_MEMORY = "write_memory"
 READ_REGISTER = "read_register"
 WRITE_REGISTER = "write_register"
+CONTINUE = "continue"
+SINGLE_STEP = "single_step"
 
 
 def ascii_hex(text: str) -> str:
@@ -213,6 +215,71 @@ class EncodeCommandTest(RspCommandsHttpTest):
         )
 
 
+class EncodeExecutionCommandTest(RspCommandsHttpTest):
+    def test_continue_without_address(self) -> None:
+        status, body = self.encode({"operation": CONTINUE})
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"c")
+
+    def test_single_step_without_address(self) -> None:
+        status, body = self.encode({"operation": SINGLE_STEP})
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"s")
+
+    def test_continue_with_address_zero(self) -> None:
+        status, body = self.encode({"operation": CONTINUE, "address": 0})
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"c0")
+
+    def test_single_step_with_address_zero(self) -> None:
+        status, body = self.encode({"operation": SINGLE_STEP, "address": 0})
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"s0")
+
+    def test_address_bare_lowercase_hex(self) -> None:
+        status, body = self.encode({"operation": CONTINUE, "address": 0xABCDEF})
+        self.assertEqual(status, 200)
+        self.assertEqual(bytes.fromhex(body["payload"]), b"cabcdef")
+
+    def test_address_max(self) -> None:
+        for operation in (CONTINUE, SINGLE_STEP):
+            with self.subTest(operation=operation):
+                status, body = self.encode({"operation": operation, "address": 0xFFFFFFFF})
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    bytes.fromhex(body["payload"]),
+                    b"cffffffff" if operation == CONTINUE else b"sffffffff",
+                )
+
+    def test_address_errors(self) -> None:
+        cases = [
+            {"operation": CONTINUE, "address": -1},
+            {"operation": CONTINUE, "address": 1 << 32},
+            {"operation": SINGLE_STEP, "address": True},
+            {"operation": SINGLE_STEP, "address": "10"},
+            {"operation": SINGLE_STEP, "address": None},
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                status, resp = self.encode(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_field")
+
+    def test_extra_fields(self) -> None:
+        cases = [
+            {"operation": CONTINUE, "length": 1},
+            {"operation": CONTINUE, "data": "ab"},
+            {"operation": CONTINUE, "register": 0},
+            {"operation": SINGLE_STEP, "address": 0, "expected_length": 1},
+            {"operation": SINGLE_STEP, "address": 0, "extra": 1},
+        ]
+        for body in cases:
+            with self.subTest(body=body):
+                status, resp = self.encode(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_field")
+
+
 class DecodeCommandResponseTest(RspCommandsHttpTest):
     def test_empty_payload_is_unsupported(self) -> None:
         for body in (
@@ -362,6 +429,172 @@ class DecodeCommandResponseTest(RspCommandsHttpTest):
                 status, resp = self.post(RESPONSE_PATH, raw)
                 self.assertEqual(status, 400)
                 self.assertEqual(resp["error"]["code"], "invalid_request")
+
+
+class DecodeExecutionResponseTest(RspCommandsHttpTest):
+    def exec_respond(self, text: str, operation: str = CONTINUE) -> tuple[int, dict]:
+        return self.respond({"operation": operation, "payload": ascii_hex(text)})
+
+    def test_empty_payload_is_unsupported(self) -> None:
+        for operation in (CONTINUE, SINGLE_STEP):
+            with self.subTest(operation=operation):
+                status, resp = self.respond({"operation": operation, "payload": ""})
+                self.assertEqual(status, 200)
+                self.assertEqual(resp, {"status": "unsupported"})
+
+    def test_error_code(self) -> None:
+        status, resp = self.exec_respond("EAF")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp, {"status": "error", "code": "af"})
+
+    def test_signal_stop(self) -> None:
+        status, resp = self.exec_respond("S05")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp, {"status": "stopped", "signal": "05", "details": []})
+
+    def test_signal_stop_signal_lowercased(self) -> None:
+        status, resp = self.exec_respond("SAB")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp["signal"], "ab")
+        self.assertEqual(resp["details"], [])
+
+    def test_t_stop_with_fields_in_order(self) -> None:
+        status, resp = self.exec_respond("T0505:04;thread:000f;")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            resp,
+            {
+                "status": "stopped",
+                "signal": "05",
+                "details": [
+                    {"key": "05", "value": "04"},
+                    {"key": "thread", "value": "000f"},
+                ],
+            },
+        )
+
+    def test_t_stop_without_trailing_semicolon(self) -> None:
+        status, resp = self.exec_respond("T0b00:deadbeef")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp["signal"], "0b")
+        self.assertEqual(resp["details"], [{"key": "00", "value": "deadbeef"}])
+
+    def test_t_stop_no_fields(self) -> None:
+        status, resp = self.exec_respond("T01")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp, {"status": "stopped", "signal": "01", "details": []})
+
+    def test_t_stop_signal_lowercased(self) -> None:
+        status, resp = self.exec_respond("TAF05:04")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp["signal"], "af")
+
+    def test_t_stop_preserves_duplicate_keys(self) -> None:
+        status, resp = self.exec_respond("T05k:1;k:2;")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            resp["details"],
+            [{"key": "k", "value": "1"}, {"key": "k", "value": "2"}],
+        )
+
+    def test_w_exited(self) -> None:
+        status, resp = self.exec_respond("W00")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp, {"status": "exited", "code": "00"})
+
+    def test_w_exited_lowercased(self) -> None:
+        status, resp = self.exec_respond("WAB")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp, {"status": "exited", "code": "ab"})
+
+    def test_x_terminated(self) -> None:
+        status, resp = self.exec_respond("X09", SINGLE_STEP)
+        self.assertEqual(status, 200)
+        self.assertEqual(resp, {"status": "terminated", "signal": "09"})
+
+    def test_console_data(self) -> None:
+        status, resp = self.exec_respond("O48656c6c6f")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp, {"status": "console", "data": "48656c6c6f"})
+
+    def test_console_empty_data(self) -> None:
+        status, resp = self.exec_respond("O")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp, {"status": "console", "data": ""})
+
+    def test_console_data_lowercased(self) -> None:
+        status, resp = self.exec_respond("OABCD")
+        self.assertEqual(status, 200)
+        self.assertEqual(resp, {"status": "console", "data": "abcd"})
+
+    def test_expected_fields_rejected(self) -> None:
+        for field in ("expected_length", "expected_size"):
+            body = {"operation": CONTINUE, "payload": "", field: 1}
+            with self.subTest(field=field):
+                status, resp = self.respond(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_field")
+
+    def test_missing_and_unknown_fields(self) -> None:
+        for body in (
+            {},
+            {"payload": ascii_hex("S05")},
+            {"operation": "step", "payload": ascii_hex("S05")},
+            {"operation": 7, "payload": ascii_hex("S05")},
+            {"operation": CONTINUE, "payload": ascii_hex("S05"), "extra": 1},
+        ):
+            with self.subTest(body=body):
+                status, resp = self.respond(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_field")
+
+    def test_invalid_responses(self) -> None:
+        cases = [
+            # Unknown prefix / OK.
+            "OK",
+            "Q01",
+            "Z05",
+            # S: bad width / non-hex / extra.
+            "S5",
+            "S005",
+            "Szz",
+            "S050",
+            # T: bad signal / field errors.
+            "T5",
+            "Tz05:04;",
+            "T050504;",          # no colon
+            "T05:04;",           # empty key
+            "T0505:;",           # empty value
+            "T0505",             # no colon (single token)
+            "T05;05:04;",        # leading semicolon -> empty field
+            "T0505:04;;06:07;",  # double semicolon
+            "T0505:04;x",        # value-only token
+            # W / X.
+            "W0",
+            "Wzz",
+            "W001",
+            "X0",
+            "Xg0",
+            # E.
+            "E1",
+            "Ezz",
+            "E001",
+            # O: odd length / non-hex.
+            "Oabc",
+            "Ozz",
+            "O48g",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                status, resp = self.exec_respond(text)
+                self.assertEqual(status, 400)
+                self.assertEqual(resp["error"]["code"], "invalid_response")
+
+    def test_non_ascii_payload_is_invalid_response(self) -> None:
+        # 0x80 after an S prefix is not ASCII.
+        status, resp = self.respond({"operation": CONTINUE, "payload": "5380"})
+        self.assertEqual(status, 400)
+        self.assertEqual(resp["error"]["code"], "invalid_response")
 
 
 if __name__ == "__main__":

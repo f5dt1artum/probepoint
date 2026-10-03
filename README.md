@@ -44,14 +44,24 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
   - `write_memory`：字段 `{"operation", "address", "data"}`，编码为 `M<address>,<长度>:<data>`。`data` 为 1 至 4096 字节的偶数位十六进制。
   - `read_register`：字段 `{"operation", "register"}`，编码为 `p<register>`；`register` 为 u16。
   - `write_register`：字段 `{"operation", "register", "value"}`，编码为 `P<register>=<value>`；`value` 为 1 至 32 字节的偶数位十六进制。
+  - `continue`：字段 `{"operation", "address"?}`，编码为 `c`（省略 `address`）或 `c<address>`；`single_step` 同理编码为 `s`/`s<address>`。`address` 为 u32，序列化为无前导零的小写十六进制（0 编码为 `0`）。
   - 内存访问要求 `address` 加访问字节数不越过 `0xffffffff`（即字节范围必须完整落在 32 位地址空间内），越界返回 `invalid_field`。
-- `POST /v1/rsp/commands/decode-response`：解释目标回复载荷，字段为 `{"operation", "payload", ...}`；`read_memory` 必须携带 `expected_length`（1 至 4096），`read_register` 必须携带 `expected_size`（1 至 32），写操作不得携带这两个字段。结果：
+- `POST /v1/rsp/commands/decode-response`：解释目标回复载荷，字段为 `{"operation", "payload", ...}`；`read_memory` 必须携带 `expected_length`（1 至 4096），`read_register` 必须携带 `expected_size`（1 至 32），写操作与 `continue`/`single_step` 不得携带这两个字段。内存/寄存器结果：
   - 空载荷返回 `{"status": "unsupported"}`。
   - `E` 加两位十六进制错误码返回 `{"status": "error", "code": "<小写两位码>"}`。
   - 读取成功返回 `{"status": "ok", "data": "<小写十六进制>"}`（内存）或 `{"status": "ok", "value": "<小写十六进制>"}`（寄存器），内容长度必须与期望值一致。
   - 写入成功只接受 ASCII `OK`，返回 `{"status": "ok"}`。
 
-请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型或取值范围错误、十六进制格式错误、写操作携带期望长度或地址溢出返回 `invalid_field`（HTTP 400）；回复含非法字符、被截断、长度与期望不符，或成功形式与 `operation` 不符（如读取收到 `OK`、写入收到数据）返回 `invalid_response`（HTTP 400）。
+`continue` 与 `single_step` 的回复（一次请求只解释一个流入口取出的 payload）：
+
+  - 空载荷与 `E` 错误码沿用上面的 `unsupported` 与 `error` 结果。
+  - `S` 加两位十六进制信号值返回 `{"status": "stopped", "signal": "<小写两位>", "details": []}`。
+  - `T` 同样返回 `stopped`，信号值规范为小写；信号之后以分号分隔的非空 ASCII `key:value` 字段按原顺序写入 `details`，每项为 `{"key": "原始键", "value": "原始值"}`；允许末尾分号，重复键保留。
+  - `W` 加两位十六进制状态码返回 `{"status": "exited", "code": "<小写两位>"}`。
+  - `X` 加两位十六进制信号值返回 `{"status": "terminated", "signal": "<小写两位>"}`。
+  - `O` 后跟偶数位十六进制数据返回 `{"status": "console", "data": "<小写十六进制>"}`，允许空数据。
+
+请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型或取值范围错误、十六进制格式错误、写操作或执行操作携带期望长度、`continue`/`single_step` 的 `address` 类型或范围错误返回 `invalid_field`（HTTP 400）；回复含非法字符、被截断、长度与期望不符，成功形式与 `operation` 不符（如读取收到 `OK`、写入收到数据），或执行回复出现未知前缀、`OK`、位数错误/含非十六进制内容的 `S`/`T`/`W`/`X`/`E`、奇数位或非十六进制的 `O` 数据、`T` 字段缺少冒号、键或值为空、含非 ASCII 内容，返回 `invalid_response`（HTTP 400）。
 
 ## 断点与观察点（v1）
 
@@ -70,4 +80,4 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-单步与栈回溯等后续能力仍刻意未实现，以便后续任务从已冻结事实出发独立设计并验证这些能力。
+栈回溯等后续能力仍刻意未实现，以便后续任务从已冻结事实出发独立设计并验证这些能力。
