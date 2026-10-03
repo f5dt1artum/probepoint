@@ -14,6 +14,16 @@ from __future__ import annotations
 
 MAX_PAYLOAD = 4096
 MAX_STREAM_DATA = 1 << 20  # 1 MiB per decode-stream request
+MAX_MEMORY = 4096  # max bytes read/written by one m/M command
+MAX_REGISTER = 32  # max bytes in one p/P register value
+
+READ_MEMORY = "read_memory"
+WRITE_MEMORY = "write_memory"
+READ_REGISTER = "read_register"
+WRITE_REGISTER = "write_register"
+_READ_OPERATIONS = frozenset({READ_MEMORY, READ_REGISTER})
+_WRITE_OPERATIONS = frozenset({WRITE_MEMORY, WRITE_REGISTER})
+_COMMAND_OPERATIONS = _READ_OPERATIONS | _WRITE_OPERATIONS
 
 DOLLAR = 0x24  # '$' packet start
 HASH = 0x23  # '#' payload/checksum separator
@@ -42,6 +52,14 @@ def _hex_bytes(value: object, field: str) -> bytes:
     if len(value) % 2 != 0 or any(c not in _HEXDIGITS for c in value):
         raise RspError("invalid_field", f"{field} must be even-length hex without prefix or separators")
     return bytes.fromhex(value)
+
+
+def _uint(value: object, bits: int, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise RspError("invalid_field", f"{field} must be an unsigned {bits}-bit integer")
+    if value < 0 or value >= 1 << bits:
+        raise RspError("invalid_field", f"{field} out of range for unsigned {bits}-bit integer")
+    return value
 
 
 def _check_fields(body: object, expected: frozenset[str]) -> dict:
@@ -188,3 +206,138 @@ def decode_stream(body: object) -> dict[str, object]:
         "discarded": discarded,
         "remainder": remainder.hex(),
     }
+
+
+_ENCODE_FIELDS = {
+    READ_MEMORY: frozenset({"operation", "address", "length"}),
+    WRITE_MEMORY: frozenset({"operation", "address", "data"}),
+    READ_REGISTER: frozenset({"operation", "register"}),
+    WRITE_REGISTER: frozenset({"operation", "register", "value"}),
+}
+_RESPONSE_FIELDS = {
+    READ_MEMORY: frozenset({"operation", "payload", "expected_length"}),
+    READ_REGISTER: frozenset({"operation", "payload", "expected_size"}),
+    WRITE_MEMORY: frozenset({"operation", "payload"}),
+    WRITE_REGISTER: frozenset({"operation", "payload"}),
+}
+_ADDRESS_MAX = 0xFFFFFFFF
+
+
+def _no_overflow(address: int, count: int, field: str) -> None:
+    # address + accessed bytes must not cross 0xffffffff (u32 overflow).
+    if address + count > _ADDRESS_MAX:
+        raise RspError("invalid_field", f"{field} crosses the end of the 32-bit address space")
+
+
+def _operation_fields(body: object, allowed_by_operation: dict[str, frozenset[str]]) -> tuple[str, dict]:
+    if not isinstance(body, dict):
+        raise RspError("invalid_request", "request body must be a JSON object")
+    if "operation" not in body:
+        raise RspError("invalid_field", "missing field(s): operation")
+    operation = body["operation"]
+    if not isinstance(operation, str) or operation not in allowed_by_operation:
+        raise RspError(
+            "invalid_field", "operation must be one of: " + ", ".join(sorted(_COMMAND_OPERATIONS))
+        )
+    allowed = allowed_by_operation[operation]
+    missing = allowed - body.keys()
+    if missing:
+        raise RspError("invalid_field", f"missing field(s): {', '.join(sorted(missing))}")
+    extra = body.keys() - allowed
+    if extra:
+        raise RspError("invalid_field", f"unexpected field(s): {', '.join(sorted(extra))}")
+    return operation, body
+
+
+def encode_command(body: object) -> dict[str, str]:
+    """Validate a command request and return its ASCII RSP payload as hex.
+
+    The returned ``{"payload": <lowercase hex>}`` feeds directly into
+    :func:`encode_packet`.  The encoded command is ``m``/``M`` for memory and
+    ``p``/``P`` for registers; numbers are bare lowercase hex and write data
+    keeps its byte order.
+    """
+    operation, fields = _operation_fields(body, _ENCODE_FIELDS)
+
+    if operation == READ_MEMORY:
+        address = _uint(fields["address"], 32, "address")
+        length = _uint(fields["length"], 32, "length")
+        if not 1 <= length <= MAX_MEMORY:
+            raise RspError("invalid_field", f"length must be between 1 and {MAX_MEMORY}")
+        _no_overflow(address, length, "address + length")
+        command = f"m{address:x},{length:x}".encode("ascii")
+
+    elif operation == WRITE_MEMORY:
+        address = _uint(fields["address"], 32, "address")
+        data_text = fields["data"]
+        data = _hex_bytes(data_text, "data")
+        if not 1 <= len(data) <= MAX_MEMORY:
+            raise RspError("invalid_field", f"data must be between 1 and {MAX_MEMORY} bytes")
+        _no_overflow(address, len(data), "address + data length")
+        command = f"M{address:x},{len(data):x}:".encode("ascii") + data_text.lower().encode("ascii")
+
+    elif operation == READ_REGISTER:
+        register = _uint(fields["register"], 16, "register")
+        command = f"p{register:x}".encode("ascii")
+
+    else:  # WRITE_REGISTER
+        register = _uint(fields["register"], 16, "register")
+        value_text = fields["value"]
+        value = _hex_bytes(value_text, "value")
+        if not 1 <= len(value) <= MAX_REGISTER:
+            raise RspError("invalid_field", f"value must be between 1 and {MAX_REGISTER} bytes")
+        command = f"P{register:x}=".encode("ascii") + value_text.lower().encode("ascii")
+
+    return {"payload": command.hex()}
+
+
+def decode_command_response(body: object) -> dict[str, object]:
+    """Validate and interpret a target response payload from decode-stream.
+
+    Returns ``{"status": "unsupported"}`` for an empty payload,
+    ``{"status": "error", "code": <two lowercase hex>}`` for an ``E`` reply,
+    ``{"status": "ok", "data"|"value": <lowercase hex>}`` for a read and
+    ``{"status": "ok"}`` for a write's ``OK``.  Anything else is an
+    ``invalid_response`` error.
+    """
+    operation, fields = _operation_fields(body, _RESPONSE_FIELDS)
+    is_read = operation in _READ_OPERATIONS
+
+    if is_read:
+        expect_field = "expected_length" if operation == READ_MEMORY else "expected_size"
+        limit = MAX_MEMORY if operation == READ_MEMORY else MAX_REGISTER
+        expected = _uint(fields[expect_field], 32, expect_field)
+        if not 1 <= expected <= limit:
+            raise RspError("invalid_field", f"{expect_field} must be between 1 and {limit}")
+
+    # The outer hex wrapping is a request field; malformed hex is invalid_field.
+    payload = _hex_bytes(fields["payload"], "payload")
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError:
+        raise RspError("invalid_response", "response payload must be ASCII")
+
+    if len(text) == 0:
+        return {"status": "unsupported"}
+
+    if text == "OK":
+        if is_read:
+            raise RspError("invalid_response", "OK is not a valid read response")
+        return {"status": "ok"}
+
+    if text[0] == "E":
+        if len(text) != 3 or any(c not in "0123456789abcdefABCDEF" for c in text[1:]):
+            raise RspError("invalid_response", "error response must be E followed by two hex digits")
+        return {"status": "error", "code": text[1:].lower()}
+
+    if not is_read:
+        raise RspError("invalid_response", "write response must be OK, empty or an E error")
+
+    if len(text) % 2 != 0 or any(c not in _HEXDIGITS for c in text):
+        raise RspError("invalid_response", "read response must be even-length hex data")
+    if len(text) // 2 != expected:
+        raise RspError("invalid_response", f"response length does not match {expect_field}")
+
+    if operation == READ_MEMORY:
+        return {"status": "ok", "data": text.lower()}
+    return {"status": "ok", "value": text.lower()}

@@ -93,6 +93,8 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/frames/decode-stream": self.service.decode_stream,
             "/v1/rsp/encode": self.service.encode_rsp_packet,
             "/v1/rsp/decode-stream": self.service.decode_rsp_stream,
+            "/v1/rsp/commands/encode": self.service.encode_rsp_command,
+            "/v1/rsp/commands/decode-response": self.service.decode_rsp_command_response,
         }
         handler = routes.get(self.path)
         if handler is None:

@@ -16,7 +16,9 @@ from .breakpoints import (
     parse_patch,
 )
 from .frames import decode_frame, decode_stream, encode_frame
+from .rsp import decode_command_response
 from .rsp import decode_stream as rsp_decode_stream
+from .rsp import encode_command
 from .rsp import encode_packet
 
 
@@ -46,6 +48,12 @@ class Service:
 
     def decode_rsp_stream(self, body: object) -> dict[str, object]:
         return rsp_decode_stream(body)
+
+    def encode_rsp_command(self, body: object) -> dict[str, str]:
+        return encode_command(body)
+
+    def decode_rsp_command_response(self, body: object) -> dict[str, object]:
+        return decode_command_response(body)
 
     def create_breakpoint(self, body: object) -> dict[str, object]:
         kind, address, size, enabled = parse_create(body)

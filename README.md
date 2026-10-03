@@ -35,6 +35,24 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型或十六进制格式错误、`eof` 非布尔值、`data` 超限返回 `invalid_field`（HTTP 400）。
 
+## GDB RSP 内存/寄存器命令与回复
+
+以下两个入口在命令载荷层工作，不连接目标、不保存会话：`encode` 产出的 `payload` 可直接交给 `/v1/rsp/encode` 打包；`decode-response` 消费 `/v1/rsp/decode-stream` 解出的包内 `payload`。命令数值均为无前导零的小写十六进制，写入数据字节顺序保持不变。
+
+- `POST /v1/rsp/commands/encode`：按 `operation` 编码 ASCII RSP 命令载荷，成功返回 `{"payload": "<小写十六进制>"}`。
+  - `read_memory`：字段 `{"operation", "address", "length"}`，编码为 `m<address>,<length>`。`address` 为 u32，`length` 为 1 至 4096。
+  - `write_memory`：字段 `{"operation", "address", "data"}`，编码为 `M<address>,<长度>:<data>`。`data` 为 1 至 4096 字节的偶数位十六进制。
+  - `read_register`：字段 `{"operation", "register"}`，编码为 `p<register>`；`register` 为 u16。
+  - `write_register`：字段 `{"operation", "register", "value"}`，编码为 `P<register>=<value>`；`value` 为 1 至 32 字节的偶数位十六进制。
+  - 内存访问要求 `address` 加访问字节数不越过 `0xffffffff`（即字节范围必须完整落在 32 位地址空间内），越界返回 `invalid_field`。
+- `POST /v1/rsp/commands/decode-response`：解释目标回复载荷，字段为 `{"operation", "payload", ...}`；`read_memory` 必须携带 `expected_length`（1 至 4096），`read_register` 必须携带 `expected_size`（1 至 32），写操作不得携带这两个字段。结果：
+  - 空载荷返回 `{"status": "unsupported"}`。
+  - `E` 加两位十六进制错误码返回 `{"status": "error", "code": "<小写两位码>"}`。
+  - 读取成功返回 `{"status": "ok", "data": "<小写十六进制>"}`（内存）或 `{"status": "ok", "value": "<小写十六进制>"}`（寄存器），内容长度必须与期望值一致。
+  - 写入成功只接受 ASCII `OK`，返回 `{"status": "ok"}`。
+
+请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失、多余、类型或取值范围错误、十六进制格式错误、写操作携带期望长度或地址溢出返回 `invalid_field`（HTTP 400）；回复含非法字符、被截断、长度与期望不符，或成功形式与 `operation` 不符（如读取收到 `OK`、写入收到数据）返回 `invalid_response`（HTTP 400）。
+
 ## 断点与观察点（v1）
 
 记录仅保存在当前服务进程中，重启后为空，不产生任何持久化副作用。id 为按创建顺序递增的正整数，同一进程内不复用；返回对象包含全部规范化字段（execute 无 `size`，其他类型带 `size`）。
