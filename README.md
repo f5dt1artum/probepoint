@@ -114,6 +114,20 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 错误语义：请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失或多余、类型错误（含布尔值冒充整数）、数值越界、非法 `label` 或 `samples` 数量越界返回 `invalid_field`（HTTP 400），且不返回任何部分结果。
 
+## Cortex-M 故障快照诊断（ARMv7-M）
+
+`POST /v1/faults/cortex-m/analyze` 是无状态入口：调用方提交异常栈帧与故障状态寄存器快照，服务端离线解码基本异常栈帧与故障原因，不连接目标、不读取硬件，也不保存任何状态。请求体仅含 `{"stacked_frame": "<偶数位十六进制>", "cfsr": u32, "hfsr": u32, "mmfar": u32, "bfar": u32}`。`stacked_frame` 必须恰好解码为 32 字节，按小端 u32 依次为 r0、r1、r2、r3、r12、lr、pc、xpsr；其余字段均为无符号 32 位整数，布尔值不接受为整数。
+
+成功返回 HTTP 200 与 `{"frame", "status", "primary", "causes", "fault_addresses"}`：
+
+- `frame` 含八个寄存器原始值（`r0`、`r1`、`r2`、`r3`、`r12`、`lr`、`pc`、`xpsr`）、`instruction_address`（`pc` 清除最低 Thumb 位后的值）与 `frame_valid`（由 xpsr 的 T 位，即第 24 位决定；T 位未置位时 `frame_valid=false`，但仍返回该帧）。
+- `status` 原样含 `cfsr`、`hfsr`，包括其中未定义的位。
+- `causes` 先按 CFSR 位号、再按 HFSR 位号升序排列，每项仅含 `register`（`"cfsr"` 或 `"hfsr"`）、`bit`、`name`。识别的 CFSR 位为 IACCVIOL(0)、DACCVIOL(1)、MUNSTKERR(3)、MSTKERR(4)、MLSPERR(5)、IBUSERR(8)、PRECISERR(9)、IMPRECISERR(10)、UNSTKERR(11)、STKERR(12)、LSPERR(13)、UNDEFINSTR(16)、INVSTATE(17)、INVPC(18)、NOCP(19)、UNALIGNED(24)、DIVBYZERO(25)；HFSR 位为 FORCED(30)、DEBUGEVT(31)。未定义位只保留在 `status`，不进入 `causes`；MMARVALID、BFARVALID 也不是原因。
+- `primary` 按 memmanage、busfault、usagefault、hardfault 的顺序取首个存在原因的类别；CFSR 第 0–7 位为 memmanage、第 8–15 位为 busfault、第 16–31 位为 usagefault，HFSR 原因为 hardfault；均无原因为 `none`。
+- `fault_addresses` 固定含 `mmfar`、`bfar`：仅当 CFSR 的 MMARVALID（第 7 位）/BFARVALID（第 15 位）置位时分别返回对应地址，否则为 JSON `null`。
+
+错误语义：请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失或多余、类型或范围错误（含布尔值冒充整数）、非法十六进制、栈帧长度不是恰好 32 字节返回 `invalid_field`（HTTP 400），且不返回任何部分结果。
+
 ## 断点与观察点（v1）
 
 记录仅保存在当前服务进程中，重启后为空，不产生任何持久化副作用。id 为按创建顺序递增的正整数，同一进程内不复用；返回对象包含全部规范化字段（execute 无 `size`，其他类型带 `size`）。
