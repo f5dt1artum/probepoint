@@ -93,6 +93,16 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 错误语义：损坏或截断的 ELF、越界的节或字符串引用、候选名称不是有效 UTF-8、符号范围越过 32 位地址空间返回 HTTP 400 `invalid_elf`；ELF 类别（非 ELF32）、字节序（非小端）或机器类型（非 `EM_ARM`）不支持返回 HTTP 422 `unsupported_elf`；两类符号表均不存在返回 HTTP 422 `symbol_table_not_found`。请求体不是合法 JSON 对象返回 `invalid_request`；字段缺失、多余、类型错误、非法十六进制、ELF 大小或地址数量越界返回 `invalid_field`，均为 HTTP 400。
 
+## 周期计数耗时分析（DWT CYCCNT）
+
+`POST /v1/performance/cycles/analyze` 是无状态入口：调用方提交已采集的 Cortex-M DWT CYCCNT 起止值，服务端将周期计数转换为可比较的耗时，不连接目标、不读取硬件，也不保存任何采样数据。请求体仅含 `{"clock_hz": 1..4294967295, "samples": [...]}`；`samples` 包含 1 至 4096 项，每项仅含 `{"label": "<字符串>", "start": u32, "end": u32}`。`label` 去除首尾 Unicode 空白后须为 1 至 64 个字符，规范化后允许重复。
+
+32 位自由运行计数器一次测量最多跨越一次回卷：`end >= start` 时 `cycles = end - start`、`wrapped=false`；否则 `cycles = 2^32 - start + end`、`wrapped=true`（`start == end` 为 0 周期、不回卷）。耗时使用整数运算计算：`duration_ns = floor(cycles × 1000000000 ÷ clock_hz)`，所有 JSON 数值均为整数，不出现浮点数或科学计数法。
+
+成功返回 HTTP 200 与 `{"samples", "summary"}`。`samples` 按输入顺序保留重复项，每项含规范化 `label`、原始 `start`、`end`、`cycles`、`wrapped` 与 `duration_ns`。`summary` 按规范化 label 首次出现顺序聚合，每项含 `label`、`count`、`total_cycles`、`min_cycles`、`max_cycles`、`average_cycles`、`total_duration_ns`、`average_duration_ns`；`total_duration_ns` 为各项 `duration_ns` 之和（而非按总周期重新取整），两个平均值分别为对应总值除以 `count` 后向下取整。
+
+错误语义：请求体不是合法 JSON 对象返回 `invalid_request`（HTTP 400）；字段缺失或多余、类型错误（含布尔值冒充整数）、数值越界、非法 label、`samples` 不是数组或数量越界返回 `invalid_field`（HTTP 400），全部样本先校验再计算，出错时不返回任何部分结果。
+
 ## 断点与观察点（v1）
 
 记录仅保存在当前服务进程中，重启后为空，不产生任何持久化副作用。id 为按创建顺序递增的正整数，同一进程内不复用；返回对象包含全部规范化字段（execute 无 `size`，其他类型带 `size`）。
