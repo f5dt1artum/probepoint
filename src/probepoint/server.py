@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from .backtrace import BacktraceError
 from .breakpoints import BreakpointError, parse_breakpoint_id
 from .channels import ChannelError
+from .faults import FaultError
 from .frames import FrameError
 from .itm import ItmError
 from .performance import PerformanceError
@@ -182,6 +183,7 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/backtrace": self.service.backtrace,
             "/v1/symbols/resolve": self.service.resolve_symbols,
             "/v1/performance/cycles/analyze": self.service.analyze_cycles,
+            "/v1/faults/cortex-m/analyze": self.service.analyze_cortex_m_fault,
         }
         handler = routes.get(self.path)
         if handler is None:
@@ -195,7 +197,7 @@ class Handler(BaseHTTPRequestHandler):
         except SymbolResolveError as exc:
             self.send_error_json(exc.status, exc.code, exc.message)
             return
-        except (FrameError, ItmError, RspError, BacktraceError, PerformanceError, ChannelError) as exc:
+        except (FrameError, ItmError, RspError, BacktraceError, PerformanceError, ChannelError, FaultError) as exc:
             self.send_error_json(400, exc.code, exc.message)
             return
         self.send_json(200, result)

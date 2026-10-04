@@ -19,6 +19,7 @@ from .breakpoints import (
 )
 from .channels import decode_channel_stream, encode_channel
 from .frames import decode_frame, decode_stream, encode_frame
+from .faults import analyze_cortex_m_fault
 from .itm import decode_stream as itm_decode_stream
 from .performance import analyze_cycles
 from .rsp import decode_command_response
@@ -81,6 +82,9 @@ class Service:
 
     def analyze_cycles(self, body: object) -> dict[str, object]:
         return analyze_cycles(body)
+
+    def analyze_cortex_m_fault(self, body: object) -> dict[str, object]:
+        return analyze_cortex_m_fault(body)
 
     def create_breakpoint(self, body: object) -> dict[str, object]:
         kind, address, size, enabled = parse_create(body)
