@@ -14,10 +14,14 @@ from .frames import FrameError
 from .itm import ItmError
 from .rsp import RspError
 from .service import Service
+from .sessions import SessionError, parse_session_id
 from .symbols import SymbolResolveError
 
 BREAKPOINTS_PATH = "/v1/breakpoints"
 BREAKPOINTS_PREFIX = BREAKPOINTS_PATH + "/"
+SESSIONS_PATH = "/v1/sessions"
+SESSIONS_PREFIX = SESSIONS_PATH + "/"
+BREAKPOINTS_SEGMENT = "breakpoints"
 
 _BAD_REQUEST = object()  # sentinel: invalid_request response already sent
 
@@ -28,6 +32,27 @@ def env_address() -> tuple[str, int]:
     if not host or not port.isdigit():
         raise SystemExit(f"invalid PROBEPOINT_ADDR: {raw!r}")
     return host, int(port)
+
+
+def parse_session_route(path: str) -> tuple | None:
+    """Split a path under ``/v1/sessions/`` into its raw shape.
+
+    Returns ``("session", sid)`` for ``.../{sid}``, ``("collection", sid)``
+    for the nested breakpoint collection, or ``("item", sid, breakpoint_id)``
+    for a nested breakpoint. Segments are returned raw; each method handler
+    validates the ids it needs (and thus controls error precedence). Returns
+    ``None`` for shapes that match no known route.
+    """
+    remainder = path[len(SESSIONS_PREFIX) :]
+    segments = remainder.split("/")
+    if len(segments) == 1 and segments[0]:
+        return ("session", segments[0])
+    if len(segments) == 2 and segments[0] and segments[1] == BREAKPOINTS_SEGMENT:
+        return ("collection", segments[0])
+    if len(segments) == 3 and segments[0] and segments[2]:
+        if segments[1] == BREAKPOINTS_SEGMENT:
+            return ("item", segments[0], segments[2])
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -75,7 +100,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, result)
             return
+        if parts.path == SESSIONS_PATH:
+            self.send_json(200, self.service.list_sessions())
+            return
+        if parts.path.startswith(SESSIONS_PREFIX):
+            self.handle_session_get(parts.path, parts.query)
+            return
         self.send_error_json(404, "not_found", f"no route for {self.path}")
+
+    def handle_session_get(self, path: str, query: str) -> None:
+        route = parse_session_route(path)
+        if route is None or route[0] != "collection":
+            self.send_error_json(404, "not_found", f"no route for {path}")
+            return
+        try:
+            session_id = parse_session_id(route[1])
+            with self.service.guard_session(session_id) as session:
+                result = self.service.list_session_breakpoints(session, query)
+        except (SessionError, BreakpointError) as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+            return
+        self.send_json(200, result)
 
     def do_POST(self) -> None:
         if self.path == BREAKPOINTS_PATH:
@@ -88,6 +133,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error_json(exc.status, exc.code, exc.message)
                 return
             self.send_json(201, result)
+            return
+
+        if self.path == SESSIONS_PATH:
+            body = self.read_json_body()
+            if body is _BAD_REQUEST:
+                return
+            try:
+                result = self.service.create_session(body)
+            except SessionError as exc:
+                self.send_error_json(exc.status, exc.code, exc.message)
+                return
+            self.send_json(201, result)
+            return
+
+        parts = urlsplit(self.path)
+        if parts.path.startswith(SESSIONS_PREFIX):
+            self.handle_session_post(parts.path)
             return
 
         routes = {
@@ -119,8 +181,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(200, result)
 
+    def handle_session_post(self, path: str) -> None:
+        route = parse_session_route(path)
+        if route is None or route[0] != "collection":
+            self.send_error_json(404, "not_found", f"no route for {path}")
+            return
+        try:
+            session_id = parse_session_id(route[1])
+            with self.service.guard_session(session_id) as session:
+                # Hold the session guard while reading the body so a
+                # concurrent delete is ordered with the whole request.
+                body = self.read_json_body()
+                if body is _BAD_REQUEST:
+                    return
+                result = self.service.create_session_breakpoint(session, body)
+        except (SessionError, BreakpointError) as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+            return
+        self.send_json(201, result)
+
     def do_PATCH(self) -> None:
         parts = urlsplit(self.path)
+        if parts.path.startswith(SESSIONS_PREFIX):
+            self.handle_session_patch(parts.path)
+            return
         if not parts.path.startswith(BREAKPOINTS_PREFIX):
             self.send_error_json(404, "not_found", f"no route for {self.path}")
             return
@@ -143,8 +227,31 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(200, result)
 
+    def handle_session_patch(self, path: str) -> None:
+        route = parse_session_route(path)
+        if route is None or route[0] != "item":
+            self.send_error_json(404, "not_found", f"no route for {path}")
+            return
+        try:
+            session_id = parse_session_id(route[1])
+            breakpoint_id = parse_breakpoint_id(route[2])
+            with self.service.guard_session(session_id) as session:
+                body = self.read_json_body()
+                if body is _BAD_REQUEST:
+                    return
+                result = self.service.update_session_breakpoint(
+                    session, breakpoint_id, body
+                )
+        except (SessionError, BreakpointError) as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+            return
+        self.send_json(200, result)
+
     def do_DELETE(self) -> None:
         parts = urlsplit(self.path)
+        if parts.path.startswith(SESSIONS_PREFIX):
+            self.handle_session_delete(parts.path)
+            return
         if not parts.path.startswith(BREAKPOINTS_PREFIX):
             self.send_error_json(404, "not_found", f"no route for {self.path}")
             return
@@ -163,6 +270,35 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(exc.status, exc.code, exc.message)
             return
         self.send_json(200, result)
+
+    def handle_session_delete(self, path: str) -> None:
+        route = parse_session_route(path)
+        if route is None:
+            self.send_error_json(404, "not_found", f"no route for {path}")
+            return
+        if route[0] == "session":
+            try:
+                session_id = parse_session_id(route[1])
+                result = self.service.delete_session(session_id)
+            except SessionError as exc:
+                self.send_error_json(exc.status, exc.code, exc.message)
+                return
+            self.send_json(200, result)
+            return
+        if route[0] == "item":
+            try:
+                session_id = parse_session_id(route[1])
+                breakpoint_id = parse_breakpoint_id(route[2])
+                with self.service.guard_session(session_id) as session:
+                    result = self.service.delete_session_breakpoint(
+                        session, breakpoint_id
+                    )
+            except (SessionError, BreakpointError) as exc:
+                self.send_error_json(exc.status, exc.code, exc.message)
+                return
+            self.send_json(200, result)
+            return
+        self.send_error_json(404, "not_found", f"no route for {path}")
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""

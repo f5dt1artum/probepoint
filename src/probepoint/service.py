@@ -8,6 +8,9 @@ backward compatible.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from . import __version__
 from .backtrace import backtrace
 from .breakpoints import (
@@ -22,6 +25,7 @@ from .rsp import decode_command_response
 from .rsp import decode_stream as rsp_decode_stream
 from .rsp import encode_command
 from .rsp import encode_packet
+from .sessions import Session, SessionStore, parse_session_create
 from .symbols import resolve_symbols
 
 
@@ -33,6 +37,7 @@ class Service:
 
     def __init__(self) -> None:
         self.breakpoints = BreakpointStore()
+        self.sessions = SessionStore()
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -80,3 +85,39 @@ class Service:
 
     def delete_breakpoint(self, record_id: int) -> dict[str, int]:
         return self.breakpoints.delete(record_id)
+
+    def create_session(self, body: object) -> dict[str, object]:
+        return self.sessions.create(parse_session_create(body))
+
+    def list_sessions(self) -> list[dict[str, object]]:
+        return self.sessions.list()
+
+    def delete_session(self, session_id: int) -> dict[str, int]:
+        return self.sessions.delete(session_id)
+
+    @contextmanager
+    def guard_session(self, session_id: int) -> Iterator[Session]:
+        with self.sessions.guard_session(session_id) as session:
+            yield session
+
+    def create_session_breakpoint(
+        self, session: Session, body: object
+    ) -> dict[str, object]:
+        kind, address, size, enabled = parse_create(body)
+        return session.breakpoints.create(kind, address, size, enabled)
+
+    def list_session_breakpoints(
+        self, session: Session, query: str
+    ) -> list[dict[str, object]]:
+        kind, enabled = parse_list_query(query)
+        return session.breakpoints.list(kind, enabled)
+
+    def update_session_breakpoint(
+        self, session: Session, breakpoint_id: int, body: object
+    ) -> dict[str, object]:
+        return session.breakpoints.update(breakpoint_id, parse_patch(body))
+
+    def delete_session_breakpoint(
+        self, session: Session, breakpoint_id: int
+    ) -> dict[str, int]:
+        return session.breakpoints.delete(breakpoint_id)

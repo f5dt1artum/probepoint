@@ -104,6 +104,20 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 错误语义：请求体不是合法 JSON 对象返回 `invalid_request`；字段缺失、多余、类型错误、数值越界、execute 携带 size、观察点缺少 size 或地址未对齐返回 `invalid_field`（字段校验先于重复检查）；`kind`、`address`、`size` 相同的记录视为重复（与启用状态无关），返回 HTTP 409 `duplicate_breakpoint`；不存在的正整数 id 返回 HTTP 404 `breakpoint_not_found`；路径 id 不是十进制正整数返回 HTTP 400 `invalid_breakpoint_id`。
 
+## 多目标调试会话（v1）
+
+会话仅保存在当前服务进程中，重启后清空且不落盘。会话 id 为按创建顺序递增的正整数，删除后不复用；会话的规范化名称（去除首尾 Unicode 空白后）在存活会话之间大小写敏感且唯一，删除后名称可再次使用。
+
+- `POST /v1/sessions`：请求体仅含 `{"name": "<1-64 字符>"}`；服务端对 `name` 去除首尾 Unicode 空白，规范化结果须为 1 至 64 个字符。成功返回 HTTP 201 与只含 `id`、`name` 的对象。
+- `GET /v1/sessions`：按 id 升序返回存活会话对象数组。
+- `DELETE /v1/sessions/{id}`：原子地删除会话及其全部断点，返回 HTTP 200 与 `{"deleted": id}`。
+
+每个会话在 `/v1/sessions/{id}/breakpoints` 集合及其 `/{breakpoint_id}` 子资源上提供与全局 `/v1/breakpoints` 完全一致的 POST、GET、PATCH、DELETE 行为（字段、返回、筛选、状态码与错误语义均一致）。断点 id 在每个会话内分别从 1 递增；同一会话按既有 `kind`、`address`、`size` 规则判重，不同会话可以保存相同记录。全局 `/v1/breakpoints` 仍是独立集合，不受会话影响。
+
+删除会话与会话内操作并发时，操作只能完整发生在删除之前，或返回 `session_not_found`；已删除的会话及其断点不会重新出现。
+
+错误语义：请求体不是合法 JSON 返回 `invalid_request`；字段缺失、多余、类型错误、规范化名称为空或超长返回 `invalid_field`，均为 HTTP 400；存活会话中名称重复返回 HTTP 409 `duplicate_session`（并发创建同名会话只有一个成功）。会话 id 不是无前导零的十进制正整数返回 HTTP 400 `invalid_session_id`；会话不存在或已删除返回 HTTP 404 `session_not_found`；嵌套的 breakpoint id 仍使用 `invalid_breakpoint_id`。
+
 ## 验证
 
 ```bash
