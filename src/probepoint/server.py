@@ -171,6 +171,8 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/frames/encode": self.service.encode_frame,
             "/v1/frames/decode": self.service.decode_frame,
             "/v1/frames/decode-stream": self.service.decode_stream,
+            "/v1/channels/encode": self.service.encode_channel,
+            "/v1/channels/decode-stream": self.service.decode_channel_stream,
             "/v1/trace/itm/decode-stream": self.service.decode_itm_stream,
             "/v1/rsp/encode": self.service.encode_rsp_packet,
             "/v1/rsp/decode-stream": self.service.decode_rsp_stream,

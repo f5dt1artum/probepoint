@@ -120,22 +120,16 @@ def decode_frame(body: object) -> dict[str, object]:
     }
 
 
-def decode_stream(body: object) -> dict[str, object]:
-    """Validate a decode-stream request and scan one stateless byte fragment.
+def _scan_stream(
+    data: bytes, eof: bool
+) -> tuple[list[dict[str, object]], list[dict[str, object]], int, bytes]:
+    """Scan one stateless fragment for v1 frames.
 
-    The fragment carries no session state: callers resubmit the previously
-    returned ``remainder`` concatenated with fresh bytes. Frames and errors
-    are reported as they appear; bytes that start no frame are counted as
-    ``discarded`` unless they may still complete with future data, in which
-    case they form the ``remainder``.
+    Returns ``(frames, errors, discarded, remainder)``. Frame entries carry
+    the raw parsed header fields, the payload as ``bytes`` and the full
+    frame length under ``total`` so callers can shape their own public
+    items; errors hold only ``offset`` and ``code``.
     """
-    fields = _check_fields(body, frozenset({"data", "eof"}))
-    if not isinstance(fields["eof"], bool):
-        raise FrameError("invalid_field", "eof must be a boolean")
-    data = _hex_bytes(fields["data"], "data")
-    if len(data) > MAX_STREAM_DATA:
-        raise FrameError("invalid_field", f"data exceeds {MAX_STREAM_DATA} decoded bytes")
-
     frames: list[dict[str, object]] = []
     errors: list[dict[str, object]] = []
     discarded = 0
@@ -152,7 +146,7 @@ def decode_stream(body: object) -> dict[str, object]:
             # Lone trailing 0x50: keep it as a potential magic start while
             # more bytes may arrive; at end of stream it is a truncated
             # candidate rather than plain noise.
-            if fields["eof"]:
+            if eof:
                 errors.append({"offset": i, "code": "truncated_frame"})
                 discarded += 1
                 i += 1
@@ -166,7 +160,7 @@ def decode_stream(body: object) -> dict[str, object]:
 
         # A full header is needed to learn the declared payload length.
         if n - i < HEADER_LEN:
-            if fields["eof"]:
+            if eof:
                 errors.append({"offset": offset, "code": "truncated_frame"})
                 discarded += n - i
                 i = n
@@ -192,7 +186,7 @@ def decode_stream(body: object) -> dict[str, object]:
 
         total = HEADER_LEN + length + CRC_LEN
         if n - i < total:
-            if fields["eof"]:
+            if eof:
                 errors.append({"offset": offset, "code": "truncated_frame"})
                 discarded += n - i
                 i = n
@@ -217,14 +211,45 @@ def decode_stream(body: object) -> dict[str, object]:
                 "flags": _flags,
                 "sequence": _sequence,
                 "opcode": _opcode,
-                "payload": chunk[HEADER_LEN : HEADER_LEN + length].hex(),
+                "payload": chunk[HEADER_LEN : HEADER_LEN + length],
+                "total": total,
             }
         )
         i += total
 
-    remainder = data[i:] if not fields["eof"] else b""
+    remainder = data[i:] if not eof else b""
+    return frames, errors, discarded, remainder
+
+
+def decode_stream(body: object) -> dict[str, object]:
+    """Validate a decode-stream request and scan one stateless byte fragment.
+
+    The fragment carries no session state: callers resubmit the previously
+    returned ``remainder`` concatenated with fresh bytes. Frames and errors
+    are reported as they appear; bytes that start no frame are counted as
+    ``discarded`` unless they may still complete with future data, in which
+    case they form the ``remainder``.
+    """
+    fields = _check_fields(body, frozenset({"data", "eof"}))
+    if not isinstance(fields["eof"], bool):
+        raise FrameError("invalid_field", "eof must be a boolean")
+    data = _hex_bytes(fields["data"], "data")
+    if len(data) > MAX_STREAM_DATA:
+        raise FrameError("invalid_field", f"data exceeds {MAX_STREAM_DATA} decoded bytes")
+
+    frames, errors, discarded, remainder = _scan_stream(data, fields["eof"])
     return {
-        "frames": frames,
+        "frames": [
+            {
+                "offset": frame["offset"],
+                "version": frame["version"],
+                "flags": frame["flags"],
+                "sequence": frame["sequence"],
+                "opcode": frame["opcode"],
+                "payload": frame["payload"].hex(),
+            }
+            for frame in frames
+        ],
         "errors": errors,
         "discarded": discarded,
         "remainder": remainder.hex(),
