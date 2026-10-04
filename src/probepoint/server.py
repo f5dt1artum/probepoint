@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 from .backtrace import BacktraceError
 from .breakpoints import BreakpointError, parse_breakpoint_id
+from .channels import ChannelError
 from .frames import FrameError
 from .itm import ItmError
 from .performance import PerformanceError
@@ -171,6 +172,8 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/frames/encode": self.service.encode_frame,
             "/v1/frames/decode": self.service.decode_frame,
             "/v1/frames/decode-stream": self.service.decode_stream,
+            "/v1/channels/encode": self.service.encode_channel,
+            "/v1/channels/decode-stream": self.service.decode_channel_stream,
             "/v1/trace/itm/decode-stream": self.service.decode_itm_stream,
             "/v1/rsp/encode": self.service.encode_rsp_packet,
             "/v1/rsp/decode-stream": self.service.decode_rsp_stream,
@@ -192,7 +195,7 @@ class Handler(BaseHTTPRequestHandler):
         except SymbolResolveError as exc:
             self.send_error_json(exc.status, exc.code, exc.message)
             return
-        except (FrameError, ItmError, RspError, BacktraceError, PerformanceError) as exc:
+        except (FrameError, ItmError, RspError, BacktraceError, PerformanceError, ChannelError) as exc:
             self.send_error_json(400, exc.code, exc.message)
             return
         self.send_json(200, result)

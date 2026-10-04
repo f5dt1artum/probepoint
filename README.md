@@ -24,6 +24,17 @@ PYTHONPATH=src python3 -m probepoint.server --host 127.0.0.1 --port 8080
 
 请求体非法返回 `error.code=invalid_request`；字段缺失、多余、类型或取值错误返回 `invalid_field`；单帧解码失败按优先级返回 `truncated_frame`、`bad_magic`、`unsupported_version`、`invalid_length`、`trailing_data`、`checksum_mismatch`，均为 HTTP 400。
 
+## 通道复用帧流（debug / serial / log）
+
+调试、串口与日志三类数据共用上述 v1 帧流，通道与 opcode 固定映射：`debug` 为 `0x0001`、`serial` 为 `0x0002`、`log` 为 `0x0003`，帧 flags 固定为零。这两个入口只做离线编解码，不连接目标、不保存会话。
+
+- `POST /v1/channels/encode`：请求体为 `{"channel": "debug"|"serial"|"log", "sequence": u32, "data": "<偶数位十六进制>"}`。`data` 解码后可为空、最多 4096 字节且字节保持原序，sequence 原样写入。成功返回 HTTP 200 与仅含小写完整帧十六进制的 `{"frame": "..."}`。
+- `POST /v1/channels/decode-stream`：无状态的流解码。请求体仅含 `{"data": "<偶数位十六进制，解码后不超过 1048576 字节>", "eof": bool}`，调用方将上次返回的 `remainder` 与新数据拼接后再次提交，服务端不保存会话。返回对象仅含 `events`、`errors`、`discarded`、`remainder`：`events` 按帧起始 `offset` 升序，每项只含 `offset`、`channel`、`sequence` 与小写 `data`，重复 sequence 保留；`errors` 每项只含 `offset` 与 `code`。空 `data` 返回两个空数组、`0` 和空字符串。
+
+流解析沿用 v1 帧的校验、错误代码、坏候选重同步、噪声计数及尾部语义（`truncated_frame`、`unsupported_version`、`invalid_length`、`checksum_mismatch`）。校验通过的帧 flags 非零时报告 `unsupported_flags`；flags 为零但 opcode 不在三种通道映射内时报告 `unsupported_channel`；两者同时出现只报告 `unsupported_flags`。这两类帧不生成事件，整帧字节计入 `discarded`，并从该帧之后继续解析。`eof=false` 时不完整候选写入小写 `remainder` 且不报错，`eof=true` 时报告 `truncated_frame` 并清空 `remainder`。
+
+请求体无法解析为 JSON 对象返回 HTTP 400 `invalid_request`；字段缺失、多余、类型错误、未知 `channel`、整数越界、非法十六进制或数据超限返回 HTTP 400 `invalid_field`。
+
 ## ARM ITM 跟踪流解码
 
 源数据包头字节：低两位为载荷长度码（1/2/3 对应 1/2/4 字节），第三位为来源（0 软件、1 硬件），高五位为端口号 0–31。`0x00` 为填充，至少五个 `0x00` 后接 `0x80` 组成同步包，`0x70` 为溢出包。

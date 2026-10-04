@@ -17,6 +17,7 @@ from .breakpoints import (
     parse_list_query,
     parse_patch,
 )
+from .channels import decode_channel_stream, encode_channel
 from .frames import decode_frame, decode_stream, encode_frame
 from .itm import decode_stream as itm_decode_stream
 from .performance import analyze_cycles
@@ -50,6 +51,12 @@ class Service:
 
     def decode_stream(self, body: object) -> dict[str, object]:
         return decode_stream(body)
+
+    def encode_channel(self, body: object) -> dict[str, str]:
+        return encode_channel(body)
+
+    def decode_channel_stream(self, body: object) -> dict[str, object]:
+        return decode_channel_stream(body)
 
     def decode_itm_stream(self, body: object) -> dict[str, object]:
         return itm_decode_stream(body)
