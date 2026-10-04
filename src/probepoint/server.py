@@ -12,6 +12,7 @@ from .backtrace import BacktraceError
 from .breakpoints import BreakpointError, parse_breakpoint_id
 from .frames import FrameError
 from .itm import ItmError
+from .performance import PerformanceError
 from .rsp import RspError
 from .service import Service
 from .sessions import SessionError, parse_session_id
@@ -177,6 +178,7 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/rsp/commands/decode-response": self.service.decode_rsp_command_response,
             "/v1/backtrace": self.service.backtrace,
             "/v1/symbols/resolve": self.service.resolve_symbols,
+            "/v1/performance/cycles/analyze": self.service.analyze_cycles,
         }
         handler = routes.get(self.path)
         if handler is None:
@@ -190,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
         except SymbolResolveError as exc:
             self.send_error_json(exc.status, exc.code, exc.message)
             return
-        except (FrameError, ItmError, RspError, BacktraceError) as exc:
+        except (FrameError, ItmError, RspError, BacktraceError, PerformanceError) as exc:
             self.send_error_json(400, exc.code, exc.message)
             return
         self.send_json(200, result)

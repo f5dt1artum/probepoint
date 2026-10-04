@@ -19,6 +19,7 @@ from .breakpoints import (
 )
 from .frames import decode_frame, decode_stream, encode_frame
 from .itm import decode_stream as itm_decode_stream
+from .performance import analyze_cycles
 from .rsp import decode_command_response
 from .rsp import decode_stream as rsp_decode_stream
 from .rsp import encode_command
@@ -70,6 +71,9 @@ class Service:
 
     def resolve_symbols(self, body: object) -> dict[str, object]:
         return resolve_symbols(body)
+
+    def analyze_cycles(self, body: object) -> dict[str, object]:
+        return analyze_cycles(body)
 
     def create_breakpoint(self, body: object) -> dict[str, object]:
         kind, address, size, enabled = parse_create(body)
